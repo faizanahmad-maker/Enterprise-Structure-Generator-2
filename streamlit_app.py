@@ -16,7 +16,7 @@ Upload up to **5 Oracle export ZIPs** (any order):
 
 uploads = st.file_uploader("Drop your ZIPs here", type="zip", accept_multiple_files=True)
 
-def read_csv_from_zip(zf: zipfile.ZipFile, name: str) -> pd.DataFrame | None:
+def read_csv_from_zip(zf, name):
     """Return a CSV as DataFrame if present in the zip; else None."""
     if name not in zf.namelist():
         return None
@@ -28,14 +28,14 @@ if not uploads:
 else:
     # ------------ Collectors ------------
     # For BU tab (Tab 1)
-    ledger_names: set[str] = set()                 # GL_PRIMARY_LEDGER.csv :: ORA_GL_PRIMARY_LEDGER_CONFIG.Name
-    legal_entity_names: set[str] = set()           # XLE_ENTITY_PROFILE.csv :: Name
-    ledger_to_idents: dict[str, set[str]] = {}     # ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv :: GL_LEDGER.Name -> {LegalEntityIdentifier}
-    ident_to_le_name: dict[str, str] = {}          # XLE_ENTITY_PROFILE / ORA_GL_JOURNAL_CONFIG_DETAIL
-    bu_rows: list[dict] = []                       # FUN_BUSINESS_UNIT.csv :: Name, PrimaryLedgerName, LegalEntityName
+    ledger_names = set()                 # GL_PRIMARY_LEDGER.csv :: ORA_GL_PRIMARY_LEDGER_CONFIG.Name
+    legal_entity_names = set()           # XLE_ENTITY_PROFILE.csv :: Name
+    ledger_to_idents = {}                # ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv :: GL_LEDGER.Name -> {LegalEntityIdentifier}
+    ident_to_le_name = {}                # XLE_ENTITY_PROFILE / ORA_GL_JOURNAL_CONFIG_DETAIL
+    bu_rows = []                         # FUN_BUSINESS_UNIT.csv :: Name, PrimaryLedgerName, LegalEntityName
 
     # For Cost Org tab (Tab 2)
-    costorg_rows: list[dict] = []                  # CST_COST_ORGANIZATION.csv :: Name, LegalEntityIdentifier
+    costorg_rows = []                    # CST_COST_ORGANIZATION.csv :: Name, LegalEntityIdentifier
 
     # ------------ Scan uploads ------------
     for up in uploads:
@@ -59,7 +59,7 @@ else:
         if df is not None:
             need = {"Name", "LegalEntityIdentifier"}
             if need.issubset(df.columns):
-                for _, r in df[need].dropna(how="all").iterrows():
+                for _, r in df[list(need)].dropna(how="all").iterrows():
                     le_name = str(r["Name"]).strip()
                     le_ident = str(r["LegalEntityIdentifier"]).strip()
                     if le_name:
@@ -74,7 +74,7 @@ else:
         if df is not None:
             need = {"GL_LEDGER.Name", "LegalEntityIdentifier"}
             if need.issubset(df.columns):
-                for _, r in df[need].dropna(how="all").iterrows():
+                for _, r in df[list(need)].dropna(how="all").iterrows():
                     led = str(r["GL_LEDGER.Name"]).strip()
                     ident = str(r["LegalEntityIdentifier"]).strip()
                     if led and ident:
@@ -87,7 +87,7 @@ else:
         if df is not None:
             need = {"LegalEntityIdentifier", "ObjectName"}
             if need.issubset(df.columns):
-                for _, r in df[need].dropna(how="all").iterrows():
+                for _, r in df[list(need)].dropna(how="all").iterrows():
                     ident = str(r["LegalEntityIdentifier"]).strip()
                     obj = str(r["ObjectName"]).strip()
                     if ident and obj and ident not in ident_to_le_name:
@@ -122,14 +122,14 @@ else:
                 st.warning(f"`CST_COST_ORGANIZATION.csv` missing {sorted(need - set(df.columns))}. Found: {list(df.columns)}")
 
     # ------------ Build Ledger <-> LE maps ------------
-    ledger_to_le_names: dict[str, set[str]] = {}
+    ledger_to_le_names = {}
     for led, idents in ledger_to_idents.items():
         for ident in idents:
             le_name = ident_to_le_name.get(ident, "").strip()
             if le_name:
                 ledger_to_le_names.setdefault(led, set()).add(le_name)
 
-    le_to_ledgers: dict[str, set[str]] = {}
+    le_to_ledgers = {}
     for led, le_set in ledger_to_le_names.items():
         for le in le_set:
             le_to_ledgers.setdefault(le, set()).add(led)
@@ -137,10 +137,10 @@ else:
     # ===================================================
     # Tab 1: Ledger – Legal Entity – Business Unit
     # ===================================================
-    rows1: list[dict] = []
-    seen_triples: set[tuple] = set()
-    seen_ledgers_with_bu: set[str] = set()
-    seen_les_with_bu: set[str] = set()
+    rows1 = []
+    seen_triples = set()
+    seen_ledgers_with_bu = set()
+    seen_les_with_bu = set()
 
     # 1) BU-driven rows with smart back-fill
     for r in bu_rows:
@@ -196,12 +196,12 @@ else:
     # ===================================================
     # Tab 2: Ledger – Legal Entity – Cost Organization
     # ===================================================
-    rows2: list[dict] = []
-    seen_triples2: set[tuple] = set()
-    seen_ledgers_with_co: set[str] = set()
-    seen_les_with_co: set[str] = set()
+    rows2 = []
+    seen_triples2 = set()
+    seen_ledgers_with_co = set()
+    seen_les_with_co = set()
 
-    # cost org rows
+    # Cost Org rows (LE-ident -> LE name -> (unique) Ledger)
     for r in costorg_rows:
         co = r["Name"]
         ident = r["LegalEntityIdentifier"]
@@ -214,16 +214,13 @@ else:
         if led: seen_ledgers_with_co.add(led)
         if le:  seen_les_with_co.add(le)
 
-    # add hanging LEs (no cost orgs yet); back-fill ledger if uniquely known
+    # Hanging LEs (no cost orgs); back-fill ledger if uniquely known
     for le in sorted(legal_entity_names - seen_les_with_co):
         led = next(iter(le_to_ledgers[le])) if le in le_to_ledgers and len(le_to_ledgers[le]) == 1 else ""
         rows2.append({"Ledger Name": led, "Legal Entity": le, "Cost Organization": ""})
 
-    # orphan ledgers (in master list) with no CO rows at all
-    mapped_ledgers = set(ledger_to_le_names.keys())
-    seen_ledgers_any_co = {a for (a, _, _) in seen_triples2 if a}
-    for led in sorted(ledger_names - seen_ledgers_any_co - (ledger_names - mapped_ledgers)):
-        # ledgers that exist but didn't appear above; include a blank row
+    # Orphan Ledgers (present in ledgers list but no CO rows)
+    for led in sorted(ledger_names - seen_ledgers_with_co):
         rows2.append({"Ledger Name": led, "Legal Entity": "", "Cost Organization": ""})
 
     df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
