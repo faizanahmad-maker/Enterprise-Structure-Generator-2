@@ -7,17 +7,18 @@ st.title("Enterprise Structure Generator — Excel + draw.io (BUs, Cost Orgs, Co
 
 st.markdown("""
 Upload up to **6 Oracle export ZIPs** (any order):
-- `Manage General Ledger` (Ledgers) → **GL_PRIMARY_LEDGER.csv**
-- `Manage Legal Entities` (Legal Entities) → **XLE_ENTITY_PROFILE.csv**
-- `Assign Legal Entities` (Ledger↔LE mapping) → **ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv**
+- `Manage General Ledger` → **GL_PRIMARY_LEDGER.csv**
+- `Manage Legal Entities` → **XLE_ENTITY_PROFILE.csv**
+- `Assign Legal Entities` → **ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv**
 - *(optional backup)* Journal config detail → **ORA_GL_JOURNAL_CONFIG_DETAIL.csv**
-- `Manage Business Units` (Business Units) → **FUN_BUSINESS_UNIT.csv**
-- `Manage Cost Organizations` (Cost Orgs) → **CST_COST_ORGANIZATION.csv**
-- `Manage Cost Organization Relationships` (Cost Books) → **CST_COST_ORG_BOOK.csv**
+- `Manage Business Units` → **FUN_BUSINESS_UNIT.csv**
+- `Manage Cost Organizations` → **CST_COST_ORGANIZATION.csv**
+- `Manage Cost Organization Relationships` → **CST_COST_ORG_BOOK.csv**
 """)
 
 uploads = st.file_uploader("Drop your ZIPs here", type="zip", accept_multiple_files=True)
 
+# ---------- helpers ----------
 def read_csv_from_zip(zf, name):
     if name not in zf.namelist():
         return None
@@ -25,22 +26,15 @@ def read_csv_from_zip(zf, name):
         return pd.read_csv(fh, dtype=str)
 
 def pick_col(df, candidates):
-    """
-    Return the first matching column from `candidates` (list of exact names or substrings).
-    - Exact match wins over substring.
-    - Case-sensitive exact; then case-insensitive exact; then substring (case-insensitive).
-    """
+    """Return the first matching column from `candidates` (exact > case-insensitive > substring)."""
     cols = list(df.columns)
-    # exact case-sensitive
     for c in candidates:
         if c in cols:
             return c
-    # exact case-insensitive
     lower_map = {c.lower(): c for c in cols}
     for c in candidates:
         if c.lower() in lower_map:
             return lower_map[c.lower()]
-    # substring (case-insensitive)
     for c in candidates:
         for existing in cols:
             if c.lower() in existing.lower():
@@ -51,20 +45,21 @@ if not uploads:
     st.info("Upload your ZIPs to generate the Excel & diagram.")
 else:
     # ------------ Collectors ------------
-    ledger_names = set()                 # GL_PRIMARY_LEDGER.csv :: ORA_GL_PRIMARY_LEDGER_CONFIG.Name
-    legal_entity_names = set()           # XLE_ENTITY_PROFILE.csv :: Name
-    ledger_to_idents = {}                # ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv :: GL_LEDGER.Name -> {LegalEntityIdentifier}
-    ident_to_le_name = {}                # XLE_ENTITY_PROFILE / ORA_GL_JOURNAL_CONFIG_DETAIL
-    bu_rows = []                         # FUN_BUSINESS_UNIT.csv :: Name, PrimaryLedgerName, LegalEntityName
+    ledger_names = set()
+    legal_entity_names = set()
+    ledger_to_idents = {}            # ledger -> {LE identifier}
+    ident_to_le_name = {}            # LE identifier -> LE name
+    bu_rows = []                     # BU rows
 
-    # Cost Org master (with code + name + LE ident)
-    # We'll keep both name and code so we can bind books via code reliably
-    costorg_rows = []                    # {Name, LegalEntityIdentifier, CostOrgCode?}
-    costorg_name_to_code = {}            # Name -> code (best effort)
-    costorg_code_to_name = {}            # code -> Name (authoritative if present)
+    # Cost Orgs (from CST_COST_ORGANIZATION)
+    # We will keep: Name, LegalEntityIdentifier, OrgInformation2 (join key to books)
+    costorg_rows = []                # [{Name, LegalEntityIdentifier, JoinKey}]
+    # Map Cost Org NAME -> set(JoinKey) because some sites duplicate names across contexts
+    costorg_name_to_joinkeys = {}
 
-    # Cost Books (from relationships ZIP)
-    books_by_costorg_code = {}           # CostOrgCode -> set([CostBookName,...])
+    # Cost Books (from CST_COST_ORG_BOOK)
+    # Map JoinKey (CostOrgCode) -> set(CostBookCode)
+    books_by_joinkey = {}
 
     # ------------ Scan uploads ------------
     for up in uploads:
@@ -83,10 +78,10 @@ else:
             else:
                 st.warning(f"`GL_PRIMARY_LEDGER.csv` missing `ORA_GL_PRIMARY_LEDGER_CONFIG.Name`. Found: {list(df.columns)}")
 
-        # Legal Entities (primary ident -> name)
+        # Legal Entities
         df = read_csv_from_zip(z, "XLE_ENTITY_PROFILE.csv")
         if df is not None:
-            name_col = pick_col(df, ["Name"])
+            name_col  = pick_col(df, ["Name"])
             ident_col = pick_col(df, ["LegalEntityIdentifier"])
             if name_col and ident_col:
                 for _, r in df[[name_col, ident_col]].dropna(how="all").iterrows():
@@ -97,12 +92,12 @@ else:
                     if le_ident and le_name:
                         ident_to_le_name[le_ident] = le_name
             else:
-                st.warning(f"`XLE_ENTITY_PROFILE.csv` missing needed cols. Found: {list(df.columns)}")
+                st.warning(f"`XLE_ENTITY_PROFILE.csv` missing needed columns. Found: {list(df.columns)}")
 
         # Ledger ↔ LE identifier
         df = read_csv_from_zip(z, "ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv")
         if df is not None:
-            led_col = pick_col(df, ["GL_LEDGER.Name"])
+            led_col   = pick_col(df, ["GL_LEDGER.Name"])
             ident_col = pick_col(df, ["LegalEntityIdentifier"])
             if led_col and ident_col:
                 for _, r in df[[led_col, ident_col]].dropna(how="all").iterrows():
@@ -111,9 +106,9 @@ else:
                     if led and ident:
                         ledger_to_idents.setdefault(led, set()).add(ident)
             else:
-                st.warning(f"`ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv` missing needed cols. Found: {list(df.columns)}")
+                st.warning(f"`ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv` missing needed columns. Found: {list(df.columns)}")
 
-        # Identifier ↔ LE name (backup)
+        # Backup map for identifier -> LE name
         df = read_csv_from_zip(z, "ORA_GL_JOURNAL_CONFIG_DETAIL.csv")
         if df is not None:
             ident_col = pick_col(df, ["LegalEntityIdentifier"])
@@ -128,9 +123,9 @@ else:
         # Business Units
         df = read_csv_from_zip(z, "FUN_BUSINESS_UNIT.csv")
         if df is not None:
-            bu_col   = pick_col(df, ["Name"])
-            led_col  = pick_col(df, ["PrimaryLedgerName"])
-            le_col   = pick_col(df, ["LegalEntityName"])
+            bu_col  = pick_col(df, ["Name"])
+            led_col = pick_col(df, ["PrimaryLedgerName"])
+            le_col  = pick_col(df, ["LegalEntityName"])
             if bu_col and led_col and le_col:
                 for _, r in df[[bu_col, led_col, le_col]].dropna(how="all").iterrows():
                     bu_rows.append({
@@ -139,44 +134,40 @@ else:
                         "LegalEntityName": str(r[le_col]).strip()
                     })
             else:
-                st.warning(f"`FUN_BUSINESS_UNIT.csv` missing needed cols. Found: {list(df.columns)}")
+                st.warning(f"`FUN_BUSINESS_UNIT.csv` missing needed columns. Found: {list(df.columns)}")
 
-        # Cost Orgs (master list with code)
+        # Cost Orgs (MASTER) — capture Name, LE Identifier, and OrgInformation2 as the JOIN KEY
         df = read_csv_from_zip(z, "CST_COST_ORGANIZATION.csv")
         if df is not None:
-            name_col  = pick_col(df, ["Name"])
-            ident_col = pick_col(df, ["LegalEntityIdentifier"])
-            code_col  = pick_col(df, ["CostOrgCode", "ORA_CST_ACCT_COST_ORG.CostOrgCode", "Cost Org Code"])
-            need = [name_col, ident_col]
-            if all(need):
-                cols = [name_col, ident_col] + ([code_col] if code_col else [])
-                for _, r in df[cols].dropna(how="all").iterrows():
-                    name  = str(r[name_col]).strip() if name_col else ""
-                    ident = str(r[ident_col]).strip() if ident_col else ""
-                    code  = str(r[code_col]).strip() if code_col and pd.notna(r[code_col]) else ""
-                    costorg_rows.append({"Name": name, "LegalEntityIdentifier": ident, "CostOrgCode": code})
-                    if name and code:
-                        costorg_name_to_code.setdefault(name, set()).add(code)
-                    if code and name:
-                        costorg_code_to_name[code] = name
+            name_col   = pick_col(df, ["Name"])
+            ident_col  = pick_col(df, ["LegalEntityIdentifier"])
+            join_col   = pick_col(df, ["OrgInformation2"])  # this is the true join to CST_COST_ORG_BOOK
+            if name_col and ident_col and join_col:
+                for _, r in df[[name_col, ident_col, join_col]].dropna(how="all").iterrows():
+                    name  = str(r[name_col]).strip()
+                    ident = str(r[ident_col]).strip()
+                    joink = str(r[join_col]).strip()
+                    costorg_rows.append({"Name": name, "LegalEntityIdentifier": ident, "JoinKey": joink})
+                    if name and joink:
+                        costorg_name_to_joinkeys.setdefault(name, set()).add(joink)
             else:
-                st.warning(f"`CST_COST_ORGANIZATION.csv` missing needed cols. Found: {list(df.columns)}")
+                st.warning(f"`CST_COST_ORGANIZATION.csv` missing needed columns (need Name, LegalEntityIdentifier, OrgInformation2). Found: {list(df.columns)}")
 
-        # Cost Books (relationships)
+        # Cost Books — map JoinKey(CostOrgCode) -> {CostBookCode,...}
         df = read_csv_from_zip(z, "CST_COST_ORG_BOOK.csv")
         if df is not None:
-            code_col = pick_col(df, ["ORA_CST_ACCT_COST_ORG.CostOrgCode", "CostOrgCode"])
-            name_col = pick_col(df, ["Name", "CostBookName"])
-            if code_col and name_col:
-                for _, r in df[[code_col, name_col]].dropna(how="all").iterrows():
-                    co_code = str(r[code_col]).strip()
-                    book_nm = str(r[name_col]).strip()
-                    if co_code and book_nm:
-                        books_by_costorg_code.setdefault(co_code, set()).add(book_nm)
+            key_col  = pick_col(df, ["ORA_CST_ACCT_COST_ORG.CostOrgCode", "CostOrgCode"])
+            book_col = pick_col(df, ["CostBookCode"])
+            if key_col and book_col:
+                for _, r in df[[key_col, book_col]].dropna(how="all").iterrows():
+                    joink = str(r[key_col]).strip()
+                    book  = str(r[book_col]).strip()
+                    if joink and book:
+                        books_by_joinkey.setdefault(joink, set()).add(book)
             else:
-                st.warning(f"`CST_COST_ORG_BOOK.csv` missing needed cols. Found: {list(df.columns)}")
+                st.warning(f"`CST_COST_ORG_BOOK.csv` missing needed columns (need ORA_CST_ACCT_COST_ORG.CostOrgCode/CostOrgCode and CostBookCode). Found: {list(df.columns)}")
 
-    # ------------ Build maps (identifier-first) ------------
+    # ------------ Derived maps ------------
     ident_to_ledgers = {}
     for led, idents in ledger_to_idents.items():
         for ident in idents:
@@ -189,14 +180,14 @@ else:
             if le_name:
                 ledger_to_le_names.setdefault(led, set()).add(le_name)
 
-    known_pairs = set()  # (ledger, LE name) from mapping table
+    known_pairs = set()
     for led, idents in ledger_to_idents.items():
         for ident in idents:
             le_name = ident_to_le_name.get(ident, "").strip()
             if le_name:
                 known_pairs.add((led, le_name))
 
-    # Legacy name-based map (for cautious back-fill in Tab 1 only)
+    # Name-based backfill map (cautious)
     le_to_ledgers_namekey = {}
     for led, le_set in ledger_to_le_names.items():
         for le in le_set:
@@ -205,11 +196,9 @@ else:
     # ===================================================
     # Tab 1: Ledger – Legal Entity – Business Unit
     # ===================================================
-    rows1 = []
-    seen_triples = set()
-    seen_ledgers_with_bu = set()
+    rows1, seen_triples, seen_ledgers_with_bu = [], set(), set()
 
-    # 1) BU-driven rows with smart back-fill (using name only if unique)
+    # 1) BU-driven rows (+ cautious backfill)
     for r in bu_rows:
         bu  = r["Name"]
         led = r["PrimaryLedgerName"] if r["PrimaryLedgerName"] in ledger_names else ""
@@ -225,18 +214,18 @@ else:
         if led:
             seen_ledgers_with_bu.add(led)
 
-    # 2) Ledger–LE pairs with no BU (from mapping)
+    # 2) Ledger–LE pairs with no BU
     seen_pairs = {(a, b) for (a, b, _) in seen_triples}
     for led, le in sorted(known_pairs):
         if (led, le) not in seen_pairs:
             rows1.append({"Ledger Name": led, "Legal Entity": le, "Business Unit": ""})
 
-    # 3) Orphan ledgers in master list (no mapping & no BUs)
+    # 3) Orphan ledgers in master list
     mapped_ledgers = set(ledger_to_le_names.keys())
     for led in sorted(ledger_names - mapped_ledgers - seen_ledgers_with_bu):
         rows1.append({"Ledger Name": led, "Legal Entity": "", "Business Unit": ""})
 
-    # 4) TRUE UNASSIGNED LEs (present in XLE profile, but nowhere else)
+    # 4) True unassigned LEs
     le_names_in_pairs = {le for (_, le) in known_pairs}
     le_names_in_bu    = {r["LegalEntityName"] for r in bu_rows if r.get("LegalEntityName")}
     for le in sorted(legal_entity_names - le_names_in_pairs - le_names_in_bu):
@@ -258,55 +247,48 @@ else:
     # Tab 2: Ledger – Legal Entity – Cost Organization – Cost Book
     # ===================================================
     rows2 = []
-    seen_pairs2 = set()   # (ledger, LE) we've already emitted via CO rows
+    seen_pairs2 = set()
 
-    # Build quick lookup: cost org name -> book list via code(s)
+    # helper: cost books for a given CO name (via all its join-keys)
     def books_for_costorg_name(co_name: str):
         co_name = (co_name or "").strip()
         if not co_name:
             return []
-        codes = sorted(costorg_name_to_code.get(co_name, []))
+        keys = sorted(costorg_name_to_joinkeys.get(co_name, []))
         acc = set()
-        for c in codes:
-            acc |= set(books_by_costorg_code.get(c, []))
-        # Fallback: if no code mapping, try reverse (rare)
-        if not acc:
-            # if a single code maps back to this name
-            for c, nm in costorg_code_to_name.items():
-                if nm == co_name and c in books_by_costorg_code:
-                    acc |= set(books_by_costorg_code[c])
+        for k in keys:
+            acc |= books_by_joinkey.get(k, set())
         return sorted(acc)
 
-    # 0) Base pairs coming from Tab 1 (so both tabs align)
+    # 0) Base pairs from Tab 1 (to align tabs)
     base_pairs = {
         (r["Ledger Name"], r["Legal Entity"])
         for _, r in df1.iterrows()
         if str(r["Ledger Name"]).strip() and str(r["Legal Entity"]).strip()
     }
 
-    # 1) From cost orgs → ident → ledgers (one row per ledger if identifier maps to multiple ledgers)
+    # 1) Emit rows from cost orgs (identifier-driven for ledger/LE)
     for r in costorg_rows:
-        co = r.get("Name", "").strip()
+        co    = r.get("Name", "").strip()
         ident = r.get("LegalEntityIdentifier", "").strip()
-        le = ident_to_le_name.get(ident, "").strip()
-        leds = ident_to_ledgers.get(ident, set())
-        cb_names = "; ".join(books_for_costorg_name(co)) if co else ""
+        le    = ident_to_le_name.get(ident, "").strip()
+        leds  = ident_to_ledgers.get(ident, set())
+        cb    = "; ".join(books_for_costorg_name(co)) if co else ""
 
         if leds:
             for led in sorted(leds):
                 rows2.append({
                     "Ledger Name": led, "Legal Entity": le,
-                    "Cost Organization": co, "Cost Book": cb_names
+                    "Cost Organization": co, "Cost Book": cb
                 })
                 seen_pairs2.add((led, le))
         else:
-            # no mapping to any ledger found; emit with blank ledger so user sees the orphan
             rows2.append({
                 "Ledger Name": "", "Legal Entity": le,
-                "Cost Organization": co, "Cost Book": cb_names
+                "Cost Organization": co, "Cost Book": cb
             })
 
-    # 2) Ensure *all* Ledger–LE pairs from Tab 1 appear here (even if no COs / no mapping)
+    # 2) Ensure all Tab 1 ledger–LE pairs appear
     for led, le in sorted(base_pairs):
         if (led, le) not in seen_pairs2:
             rows2.append({
@@ -315,7 +297,7 @@ else:
             })
             seen_pairs2.add((led, le))
 
-    # 3) Also add mapping-known pairs that didn't appear yet (paranoia/safety)
+    # 3) Add remaining mapping-known pairs (safety)
     for led, le in sorted(known_pairs):
         if (led, le) not in seen_pairs2:
             rows2.append({
@@ -324,9 +306,9 @@ else:
             })
             seen_pairs2.add((led, le))
 
-    # 4) Completely orphan ledgers (exist in masters, but no CO rows and no base pair)
-    seen_ledgers_any_co = {row["Ledger Name"] for row in rows2 if row["Ledger Name"]}
-    for led in sorted(ledger_names - seen_ledgers_any_co):
+    # 4) Orphan ledgers (in masters but unseen)
+    seen_ledgers_any = {row["Ledger Name"] for row in rows2 if row["Ledger Name"]}
+    for led in sorted(ledger_names - seen_ledgers_any):
         rows2.append({
             "Ledger Name": led, "Legal Entity": "",
             "Cost Organization": "", "Cost Book": ""
@@ -361,7 +343,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # ===================== DRAW.IO DIAGRAM BLOCK (with parking lots + Cost Books) =====================
+    # ===================== DRAW.IO DIAGRAM BLOCK (with Cost Books) =====================
     if (
         "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
         "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -380,15 +362,15 @@ else:
             Y_LEDGER   = 150
             Y_LE       = 310
             Y_BU       = 470
-            Y_CO       = 630   # cost orgs row
-            Y_CB       = 790   # cost book row (new)
+            Y_CO       = 630
+            Y_CB       = 790
 
             # --- styles ---
             S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
             S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
             S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
             S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#E2F7E2;strokeColor=#3D8B3D;fontSize=12;"
-            S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#CFF5CF;strokeColor=#2F7D2F;fontSize=12;"  # deeper green
+            S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#CFF5CF;strokeColor=#2F7D2F;fontSize=12;"
             S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
                         "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
             S_HDR    = "text;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;"
@@ -419,16 +401,14 @@ else:
                 if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"]:
                     co_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Cost Organization"])
 
-            # cost books map (under a specific Cost Org label)
             cb_map = {}
             for _, r in df_co_books.iterrows():
                 L = r["Ledger Name"]; E = r["Legal Entity"]; C = r["Cost Organization"]; B = r["Cost Book"]
                 if L and E and C and B:
-                    # split if multiple books joined by "; "
                     for book in [b.strip() for b in B.split(";") if b.strip()]:
                         cb_map.setdefault((L, E, C), set()).add(book)
 
-            # -------- parking-lot sets --------
+            # parking lots
             orphan_ledgers = sorted([L for L in ledgers_all if not le_map.get(L)])
             unassigned_les = sorted(
                 set(df_bu.loc[(df_bu["Ledger Name"] == "") & (df_bu["Legal Entity"] != ""), "Legal Entity"].unique())
@@ -443,27 +423,24 @@ else:
             )
             unassigned_bus = sorted(all_bus - assigned_bus)
 
-            # --- x-coordinates ---
+            # x-coordinates
             next_x = LEFT_PAD
             led_x, le_x, bu_x, co_x, cb_x = {}, {}, {}, {}, {}
 
             for L in ledgers_all:
                 if L in orphan_ledgers:
-                    continue  # show in parking lot, not grid
+                    continue
                 les = sorted(le_map.get(L, []))
                 for le in les:
                     buses = sorted(bu_map.get((L, le), []))
                     cos   = sorted(co_map.get((L, le), []))
-                    # pre-allocate children X for BUs and COs
                     all_children = (buses + cos) if (buses or cos) else [le]
 
                     for child in all_children:
                         if (child in buses) and (child not in bu_x):
-                            bu_x[child] = next_x
-                            next_x += X_STEP
+                            bu_x[child] = next_x; next_x += X_STEP
                         elif (child in cos) and (child not in co_x):
-                            co_x[child] = next_x
-                            next_x += X_STEP
+                            co_x[child] = next_x; next_x += X_STEP
 
                     if buses or cos:
                         xs = []
@@ -471,44 +448,35 @@ else:
                         if cos:   xs += [co_x[c] for c in cos]
                         le_x[(L, le)] = int(sum(xs)/len(xs))
                     else:
-                        le_x[(L, le)] = next_x
-                        next_x += X_STEP
+                        le_x[(L, le)] = next_x; next_x += X_STEP
 
-                    # cost books sit under each cost org; allocate beneath its X, expanding if multiple
+                    # allocate books under each CO
                     for c in cos:
                         books = sorted(cb_map.get((L, le, c), []))
                         if books:
-                            # center books around the cost org X if multiple
                             base_x = co_x[c]
                             start_x = base_x - (len(books)-1) * (X_STEP//2)
                             for i, bk in enumerate(books):
                                 cb_x[(L, le, c, bk)] = start_x + i*(X_STEP)
-                        # else: no CBs; nothing to place
 
                 if les:
                     xs = [le_x[(L, le)] for le in les]
                     led_x[L] = int(sum(xs)/len(xs))
                 next_x += PAD_GROUP
 
-            # allocate parking lots to the right
+            # right-side parking
             next_x += RIGHT_PAD
-            # Unassigned LEs
             for e in unassigned_les:
-                le_x[("UNASSIGNED", e)] = next_x
-                next_x += X_STEP
+                le_x[("UNASSIGNED", e)] = next_x; next_x += X_STEP
             next_x += PAD_GROUP
-            # Unassigned BUs
             for b in unassigned_bus:
                 if b not in bu_x:
-                    bu_x[b] = next_x
-                    next_x += X_STEP
-            # Orphan Ledgers (place last)
+                    bu_x[b] = next_x; next_x += X_STEP
             next_x += PAD_GROUP
             for L in orphan_ledgers:
-                led_x[("ORPHAN", L)] = next_x
-                next_x += X_STEP
+                led_x[("ORPHAN", L)] = next_x; next_x += X_STEP
 
-            # --- XML skeleton ---
+            # XML skeleton
             mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
             diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
             model   = ET.SubElement(diagram, "mxGraphModel", attrib={
@@ -543,11 +511,10 @@ else:
                     "x": str(int(x)), "y": str(int(y)), "width": "260", "height": "22", "as": "geometry"})
                 return tid
 
-            # --- vertices ---
+            # vertices
             id_map = {}
-            # main grid
             for L in ledgers_all:
-                if L in orphan_ledgers:
+                if L in orphan_ledgers: 
                     continue
                 id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
                 for le in sorted(le_map.get(L, [])):
@@ -556,11 +523,9 @@ else:
                         id_map[("B", L, le, b)] = add_vertex(b, S_BU, bu_x[b], Y_BU)
                     for c in sorted(co_map.get((L, le), [])):
                         id_map[("C", L, le, c)] = add_vertex(c, S_CO, co_x[c], Y_CO)
-                        # books for this cost org
                         for bk in sorted(cb_map.get((L, le, c), [])):
                             id_map[("CB", L, le, c, bk)] = add_vertex(bk, S_CB, cb_x.get((L, le, c, bk), co_x[c]), Y_CB)
 
-            # parking lot headers + vertices
             if unassigned_les:
                 add_text("Unassigned LEs", le_x[("UNASSIGNED", unassigned_les[0])] - 40, Y_LE - 40)
                 for e in unassigned_les:
@@ -572,15 +537,14 @@ else:
                     id_map[("B_UN", b)] = add_vertex(b, S_BU, bu_x[b], Y_BU)
 
             if orphan_ledgers:
-                # place header roughly above their area
                 any_x = led_x[("ORPHAN", orphan_ledgers[0])]
                 add_text("Orphan Ledgers", any_x - 60, Y_LEDGER - 40)
                 for L in orphan_ledgers:
                     id_map[("L_ORPHAN", L)] = add_vertex(L, S_LEDGER, led_x[("ORPHAN", L)], Y_LEDGER)
 
-            # --- edges (assigned only, child→parent) ---
+            # edges (child→parent)
             for L in ledgers_all:
-                if L in orphan_ledgers:
+                if L in orphan_ledgers: 
                     continue
                 for le in sorted(le_map.get(L, [])):
                     if ("E", L, le) in id_map and ("L", L) in id_map:
@@ -591,12 +555,11 @@ else:
                     for c in sorted(co_map.get((L, le), [])):
                         if ("C", L, le, c) in id_map:
                             add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
-                            # books up to CO
                             for bk in sorted(cb_map.get((L, le, c), [])):
                                 if ("CB", L, le, c, bk) in id_map:
                                     add_edge(id_map[("CB", L, le, c, bk)], id_map[("C", L, le, c)])
 
-            # Legend
+            # legend
             def add_legend(x=20, y=20):
                 def swatch(lbl, color, offset):
                     box = ET.SubElement(root, "mxCell", attrib={
@@ -615,7 +578,7 @@ else:
                 swatch("Legal Entity", "#FFE2C2", 62)
                 swatch("Business Unit", "#FFF1B3", 88)
                 swatch("Cost Org", "#E2F7E2", 114)
-                swatch("Cost Book", "#CFF5CF", 140)  # NEW
+                swatch("Cost Book", "#CFF5CF", 140)
             add_legend()
 
             return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
