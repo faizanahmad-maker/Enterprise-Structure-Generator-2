@@ -195,7 +195,7 @@ else:
     )
     df1.insert(0, "Assignment", range(1, len(df1) + 1))
 
-   # ===================================================
+        # ===================================================
     # Tab 2: Ledger – Legal Entity – Cost Organization  (identifier-driven + BU-union)
     # ===================================================
     rows2 = []
@@ -250,6 +250,23 @@ else:
         .reset_index(drop=True)
     )
     df2.insert(0, "Assignment", range(1, len(df2) + 1))
+
+    # ------------ Excel Output ------------
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+        df1.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
+        df2.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_Assignments")
+
+    st.success(f"Built {len(df1)} BU rows and {len(df2)} Cost Org rows.")
+    st.dataframe(df1.head(25), use_container_width=True, height=280)
+    st.dataframe(df2.head(25), use_container_width=True, height=280)
+
+    st.download_button(
+        "⬇️ Download Excel (EnterpriseStructure.xlsx)",
+        data=excel_buf.getvalue(),
+        file_name="EnterpriseStructure.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
     # ===================== DRAW.IO DIAGRAM BLOCK (with parking lots, safe guards) =====================
     if (
