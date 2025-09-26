@@ -4,7 +4,7 @@ import base64
 import uuid
 import re
 import zipfile
-from typing import Dict, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -12,11 +12,11 @@ from openpyxl import Workbook
 import xml.etree.ElementTree as ET
 
 
-st.set_page_config(page_title="ES Generator — ZIP Input (Cost Orgs)", layout="wide")
+st.set_page_config(page_title="ES Generator — Multi-ZIP (Cost Orgs)", layout="wide")
 
 
 # =========================
-# Small utilities
+# Utilities
 # =========================
 
 def _deflate_base64(xml_text: str) -> str:
@@ -33,21 +33,20 @@ def _norm(s: Optional[str]) -> str:
 def _rename_like(df: pd.DataFrame, want: str) -> str:
     """Return the actual column name in df that matches logical name `want` by normalization."""
     targets = { _norm(c): c for c in df.columns }
-    if want in targets:                     # exact normalized match
+    if want in targets:
         return targets[want]
-    # common aliases
     aliases = {
         "ledger": {"ledger", "ledgername", "primaryledger", "ledger_name"},
         "legalentityname": {"legalentityname", "legal entity name", "le name", "name (legal entity)"},
         "businessunitname": {"businessunitname", "business unit name", "bu name"},
         "identifier": {"identifier", "legalentityidentifier", "le identifier", "id"},
-        "name": {"name"}
+        "name": {"name"},
     }
     for alias in aliases.get(want, set()):
         if alias in targets:
             return targets[alias]
     # loose contains
-    for k,v in targets.items():
+    for k, v in targets.items():
         if want in k:
             return v
     raise KeyError(f"Could not locate a column like '{want}' in {list(df.columns)}")
@@ -69,11 +68,9 @@ class GraphBuilder:
     def add_node(self, label: str, x: int, y: int, w: int, h: int, style: str = "") -> str:
         cid = _new_id()
         self.cells.append({
-            "id": cid,
-            "value": label,
+            "id": cid, "value": label,
             "style": f"whiteSpace=wrap;html=1;align=center;{style}",
-            "vertex": "1",
-            "parent": self.layer_id,
+            "vertex": "1", "parent": self.layer_id,
             "geometry": {"x": x, "y": y, "width": w, "height": h}
         })
         return cid
@@ -81,12 +78,8 @@ class GraphBuilder:
     def add_edge(self, src: str, dst: str, style: str = "") -> str:
         eid = _new_id()
         self.cells.append({
-            "id": eid,
-            "edge": "1",
-            "parent": self.layer_id,
-            "style": style,
-            "source": src,
-            "target": dst
+            "id": eid, "edge": "1", "parent": self.layer_id,
+            "style": style, "source": src, "target": dst
         })
         return eid
 
@@ -115,95 +108,101 @@ class GraphBuilder:
 
 
 # =========================
-# ZIP ingestion
+# Multi-ZIP ingestion & standardization
 # =========================
 
-def extract_csvs_from_zip(zip_bytes: bytes) -> Dict[str, pd.DataFrame]:
-    """
-    Read all CSVs from the uploaded Oracle export ZIP.
-    Return dict: {lower_filename: DataFrame}
-    """
-    out = {}
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+def _iter_zip_csvs(file_bytes: bytes):
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
         for name in z.namelist():
             if name.lower().endswith(".csv"):
                 with z.open(name) as f:
                     df = pd.read_csv(f, dtype=str).rename(columns=lambda c: c.strip())
-                    out[name.lower()] = df
-    if not out:
-        raise ValueError("No CSV files found inside the ZIP.")
-    return out
+                    yield name.lower(), df
 
-def select_frames_from_zip(csvs: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Return (df_le_bu, df_le, df_co)
-    - df_le_bu columns: Ledger, LegalEntityName, BusinessUnitName  (may be empty if not found)
-    - df_le columns: Identifier, Name, [Ledger optional]
-    - df_co columns: CostOrganization, LegalEntityIdentifier
-    """
-    # Cost Orgs (required)
-    co_key = next((k for k in csvs if "cst_cost_organization" in k or "cost_organization" in k), None)
-    if not co_key:
-        raise ValueError("ZIP must include CST_COST_ORGANIZATION.csv (Cost Organizations).")
-    df_co_raw = csvs[co_key].copy()
-
-    # Legal Entities (required)
-    le_key = next((k for k in csvs if "legal_entities" in k or "legal entity" in k), None)
-    if not le_key:
-        raise ValueError("ZIP must include MANAGE_LEGAL_ENTITIES.csv (Legal Entities).")
-    df_le_raw = csvs[le_key].copy()
-
-    # Ledger–LE–BU (optional; many orgs have a curated export; otherwise we skip BUs)
-    llb_key = next(
-        (k for k in csvs if "ledger" in k and "legal" in k and "business" in k),
-        None
-    )
-    df_le_bu_raw = csvs[llb_key].copy() if llb_key else pd.DataFrame()
-
-    # --- Standardize CO
-    name_col = _rename_like(df_co_raw, "name")
-    leid_col = _rename_like(df_co_raw, "legalentityidentifier")
-    df_co = df_co_raw.rename(columns={name_col: "CostOrganization", leid_col: "LegalEntityIdentifier"})[
+def _standardize_co(df: pd.DataFrame) -> pd.DataFrame:
+    name_col = _rename_like(df, "name")
+    leid_col = _rename_like(df, "legalentityidentifier")
+    out = df.rename(columns={name_col: "CostOrganization", leid_col: "LegalEntityIdentifier"})[
         ["CostOrganization", "LegalEntityIdentifier"]
     ].astype(str)
+    return out
 
-    # --- Standardize LE
-    id_col = _rename_like(df_le_raw, "identifier")
-    nm_col = _rename_like(df_le_raw, "name")
-    df_le = df_le_raw.rename(columns={id_col: "Identifier", nm_col: "Name"}).astype(str)
-
-    # Optional ledger col
+def _standardize_le(df: pd.DataFrame) -> pd.DataFrame:
+    id_col = _rename_like(df, "identifier")
+    nm_col = _rename_like(df, "name")
+    out = df.rename(columns={id_col: "Identifier", nm_col: "Name"}).astype(str)
+    # try to normalize ledger name if present
     ledger_col = None
-    for c in df_le.columns:
+    for c in out.columns:
         if _norm(c) in {"ledger", "ledgername", "primaryledger", "ledger_name"}:
             ledger_col = c
             break
     if ledger_col and ledger_col != "Ledger":
-        df_le = df_le.rename(columns={ledger_col: "Ledger"})
-    if "Ledger" not in df_le.columns:
-        df_le["Ledger"] = ""
+        out = out.rename(columns={ledger_col: "Ledger"})
+    if "Ledger" not in out.columns:
+        out["Ledger"] = ""
+    return out[["Identifier", "Name", "Ledger"]]
 
-    # --- Standardize Ledger–LE–BU (if present)
-    if not df_le_bu_raw.empty:
-        L = _rename_like(df_le_bu_raw, "ledger")
-        LE = _rename_like(df_le_bu_raw, "legalentityname")
-        BU = _rename_like(df_le_bu_raw, "businessunitname")
-        df_le_bu = df_le_bu_raw.rename(columns={L: "Ledger", LE: "LegalEntityName", BU: "BusinessUnitName"})[
-            ["Ledger", "LegalEntityName", "BusinessUnitName"]
-        ].astype(str)
+def _standardize_llb(df: pd.DataFrame) -> pd.DataFrame:
+    L = _rename_like(df, "ledger")
+    LE = _rename_like(df, "legalentityname")
+    BU = _rename_like(df, "businessunitname")
+    out = df.rename(columns={L: "Ledger", LE: "LegalEntityName", BU: "BusinessUnitName"})[
+        ["Ledger", "LegalEntityName", "BusinessUnitName"]
+    ].astype(str)
+    return out
+
+def load_from_multi_zips(files: List[io.BytesIO]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Scan all uploaded zips and merge:
+      - Cost Orgs (required)
+      - Legal Entities (required)
+      - Ledger–LE–BU (optional)
+    Returns (df_le_bu, df_le, df_co)
+    """
+    co_parts, le_parts, llb_parts = [], [], []
+
+    for f in files:
+        for fname, df in _iter_zip_csvs(f):
+            lf = fname.lower()
+            if "cst_cost_organization" in lf or "cost_organization" in lf:
+                try:
+                    co_parts.append(_standardize_co(df))
+                except Exception:
+                    pass
+            elif "legal_entities" in lf or "legal entity" in lf:
+                try:
+                    le_parts.append(_standardize_le(df))
+                except Exception:
+                    pass
+            elif ("ledger" in lf and "legal" in lf and "business" in lf) or ("ledger-le-bu" in lf):
+                try:
+                    llb_parts.append(_standardize_llb(df))
+                except Exception:
+                    pass
+
+    if not co_parts:
+        raise ValueError("None of the ZIPs contained CST_COST_ORGANIZATION*.csv (Cost Organizations).")
+    if not le_parts:
+        raise ValueError("None of the ZIPs contained MANAGE_LEGAL_ENTITIES*.csv (Legal Entities).")
+
+    df_co = (pd.concat(co_parts, ignore_index=True).drop_duplicates().reset_index(drop=True))
+    df_le = (pd.concat(le_parts, ignore_index=True).drop_duplicates().reset_index(drop=True))
+
+    if llb_parts:
+        df_le_bu = (pd.concat(llb_parts, ignore_index=True)
+                    .dropna(subset=["LegalEntityName", "Ledger"], how="all")
+                    .drop_duplicates().reset_index(drop=True))
     else:
-        # minimal frame (no BUs)
-        df_le_bu = (
-            df_le.rename(columns={"Name": "LegalEntityName"})[["Ledger", "LegalEntityName"]]
-            .drop_duplicates()
-        )
+        # minimal when BU data missing
+        df_le_bu = df_le.rename(columns={"Name": "LegalEntityName"})[["Ledger", "LegalEntityName"]].drop_duplicates()
         df_le_bu["BusinessUnitName"] = pd.NA
 
-    return df_le_bu, df_le[["Identifier", "Name", "Ledger"]], df_co
+    return df_le_bu, df_le, df_co
 
 
 # =========================
-# Cost Org tab builder
+# Cost Org tab & XLSX builder
 # =========================
 
 def build_costorg_tab(df_le_bu: pd.DataFrame, df_le: pd.DataFrame, df_co: pd.DataFrame) -> pd.DataFrame:
@@ -217,7 +216,6 @@ def build_costorg_tab(df_le_bu: pd.DataFrame, df_le: pd.DataFrame, df_co: pd.Dat
     out = out.sort_values(["Ledger", "LegalEntityName", "CostOrganization"],
                           na_position="last").reset_index(drop=True)
     return out
-
 
 def dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     wb = Workbook()
@@ -236,7 +234,7 @@ def dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
 # Diagram builder
 # =========================
 
-# Layout (tweak to taste)
+# Layout (disciplined columns; CO lower)
 X_LEDGER = 40
 X_LE     = 320
 X_BU     = 650
@@ -245,7 +243,7 @@ X_CO     = 950
 Y_START_LEDGER = 40
 Y_START_LE     = 40
 Y_START_BU     = 40
-Y_START_CO     = 220   # Cost Orgs lower than BU
+Y_START_CO     = 220
 Y_STEP = 90
 NODE_W, NODE_H = 170, 48
 
@@ -260,7 +258,6 @@ STYLE_EDGE_BASE = ("endArrow=block;endFill=1;rounded=1;jettySize=auto;"
 STYLE_LEDGER_TO_LE = STYLE_EDGE_BASE + "strokeColor=#666666;strokeWidth=2;"
 STYLE_LE_TO_BU     = STYLE_EDGE_BASE + "strokeColor=#FFD400;strokeWidth=2;"  # yellow
 STYLE_LE_TO_CO     = STYLE_EDGE_BASE + "strokeColor=#1F75FE;strokeWidth=2;"  # blue
-
 
 def build_drawio(df_le_bu: pd.DataFrame, df_cost_tab: pd.DataFrame) -> str:
     g = GraphBuilder(name="Enterprise Structure (+ Cost Orgs)")
@@ -296,7 +293,7 @@ def build_drawio(df_le_bu: pd.DataFrame, df_cost_tab: pd.DataFrame) -> str:
         g.add_edge(ledger_ids.get(L or "", list(ledger_ids.values())[0]), nid, STYLE_LEDGER_TO_LE)
         y_le += Y_STEP
 
-    # BUs (if we have them)
+    # BUs (if present)
     if df_le_bu["BusinessUnitName"].notna().any():
         for (L, LE), grp in df_le_bu.groupby(["Ledger", "LegalEntityName"], dropna=False):
             y_bu = Y_START_BU
@@ -322,40 +319,42 @@ def build_drawio(df_le_bu: pd.DataFrame, df_cost_tab: pd.DataFrame) -> str:
 # UI
 # =========================
 
-st.title("Enterprise Structure Generator — ZIP Input with Cost Orgs")
+st.title("Enterprise Structure Generator — Multi-ZIP Input with Cost Orgs")
 st.caption(
-    "Upload your Oracle export **ZIP**. I’ll read `CST_COST_ORGANIZATION.csv` and `MANAGE_LEGAL_ENTITIES.csv`, "
-    "build a new **ES – Ledger–LE–CostOrg** sheet, and produce a .drawio with **yellow LE→BU** and **blue LE→Cost Org** "
-    "(with line-jump bridges). Cost Orgs sit on a lower vertical layer than BUs."
+    "Drop **one or more Oracle export ZIPs**. I’ll merge `CST_COST_ORGANIZATION*.csv` and `MANAGE_LEGAL_ENTITIES*.csv` "
+    "across all files, build **ES – Ledger–LE–CostOrg**, and generate a .drawio with **yellow LE→BU** and **blue LE→Cost Org** "
+    "(line-jump bridges). Cost Orgs render on a lower vertical layer than BUs."
 )
 
 with st.sidebar:
-    zip_file = st.file_uploader("Oracle Export (.zip)", type=["zip"])
+    zip_files = st.file_uploader("Oracle Export ZIPs", type=["zip"], accept_multiple_files=True)
     run = st.button("Build Tab + Diagram")
 
 st.markdown("""
-**What I look for inside the ZIP (filenames can vary):**
-- `CST_COST_ORGANIZATION*.csv` – must include columns **Name**, **LegalEntityIdentifier**  
-- `MANAGE_LEGAL_ENTITIES*.csv` – must include columns **Identifier**, **Name** (Ledger optional)  
-- *(Optional)* a curated **Ledger–LE–BU** CSV containing **Ledger**, **LegalEntityName**, **BusinessUnitName**  
+**Inside each ZIP, I try to find (names can vary):**
+- `CST_COST_ORGANIZATION*.csv` → columns **Name**, **LegalEntityIdentifier** *(required)*  
+- `MANAGE_LEGAL_ENTITIES*.csv` → columns **Identifier**, **Name** *(required; Ledger optional)*  
+- `*Ledger*Legal*Business*.csv` or `*ledger-le-bu*.csv` → **Ledger**, **LegalEntityName**, **BusinessUnitName** *(optional)*
 """)
 
 if run:
-    if not zip_file:
-        st.error("Upload a ZIP file first.")
+    if not zip_files:
+        st.error("Upload at least one ZIP.")
         st.stop()
     try:
-        csvs = extract_csvs_from_zip(zip_file.read())
-        df_le_bu, df_le, df_co = select_frames_from_zip(csvs)
+        # Read all zips into memory bytes list (Streamlit UploadedFile is file-like)
+        zip_bytes_list = [zf.read() for zf in zip_files]
+
+        df_le_bu, df_le, df_co = load_from_multi_zips(zip_bytes_list)
         df_cost_tab = build_costorg_tab(df_le_bu, df_le, df_co)
 
-        # Output workbook containing only the new tab (by design for this ZIP flow)
+        # Output workbook containing the new tab
         xlsx_bytes = dataframe_to_xlsx_bytes(df_cost_tab, "ES – Ledger–LE–CostOrg")
 
         # Diagram
         drawio_xml = build_drawio(df_le_bu, df_cost_tab)
 
-        st.success("✅ Built the Cost Org tab and diagram from the ZIP.")
+        st.success("✅ Built the Cost Org tab and diagram from multiple ZIPs.")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -377,11 +376,10 @@ if run:
             st.dataframe(df_cost_tab.head(50))
 
         unmapped = int(df_cost_tab["__WARN_UnmappedLE"].sum())
-        st.info(f"Unmapped Cost Orgs (no LE name found): **{unmapped}**")
+        st.info(f"Unmapped Cost Orgs (no LE name found after merges): **{unmapped}**")
 
         with st.expander("Diagram XML (first ~60 lines)"):
             st.code("\n".join(drawio_xml.splitlines()[:60]), language="xml")
 
     except Exception as e:
         st.exception(e)
-
