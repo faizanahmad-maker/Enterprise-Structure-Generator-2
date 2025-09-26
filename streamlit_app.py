@@ -9,9 +9,30 @@ import xml.etree.ElementTree as ET
 st.set_page_config(page_title="ES Generator — Two Tabs + Diagram", layout="wide")
 st.title("Enterprise Structure Generator — Two Tabs + Diagram")
 
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _read_csv_from_zip(z: zipfile.ZipFile, name: str) -> Optional[pd.DataFrame]:
+    if name not in z.namelist():
+        return None
+    with z.open(name) as fh:
+        return pd.read_csv(fh, dtype=str)
+
+def _norm(s) -> str:
+    if pd.isna(s): return ""
+    x = str(s).strip()
+    return "" if x.lower() in ("nan", "none", "null") else x
+
+def _deflate_base64(text: str) -> str:
+    """Raw DEFLATE (wbits=-15) + base64 — what draw.io expects inside <diagram>."""
+    comp = zlib.compressobj(level=9, wbits=-15)
+    raw = comp.compress(text.encode("utf-8")) + comp.flush()
+    return base64.b64encode(raw).decode("ascii")
+
+# ──────────────────────────────────────────────────────────────────────────────
 # OG filenames / columns
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 FN_LEDGER_LIST        = "GL_PRIMARY_LEDGER.csv"                   # optional catalog
 COL_LEDGER_LIST_NAME  = "ORA_GL_PRIMARY_LEDGER_CONFIG.Name"
 
@@ -35,23 +56,9 @@ FN_COST_ORGS          = "CST_COST_ORGANIZATION.csv"               # required for
 COL_CO_NAME           = "Name"
 COL_CO_IDENTIFIER     = "LegalEntityIdentifier"
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _read_csv_from_zip(z: zipfile.ZipFile, name: str) -> Optional[pd.DataFrame]:
-    if name not in z.namelist():
-        return None
-    with z.open(name) as fh:
-        return pd.read_csv(fh, dtype=str)
-
-def _norm(s) -> str:
-    if pd.isna(s): return ""
-    x = str(s).strip()
-    return "" if x.lower() in ("nan", "none", "null") else x
-
-# -----------------------------
-# Build ES – Ledger–LE–BU (reuse your OG logic)
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Build ES – Ledger–LE–BU (your OG logic, trimmed to output the three columns)
+# ──────────────────────────────────────────────────────────────────────────────
 def build_ledger_le_bu_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFrame:
     ledger_names = set()
     legal_entity_names = set()
@@ -61,12 +68,12 @@ def build_ledger_le_bu_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFrame:
 
     for blob in zip_bytes_list:
         with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            # Ledgers
+            # Ledgers (catalog)
             df = _read_csv_from_zip(z, FN_LEDGER_LIST)
             if df is not None and COL_LEDGER_LIST_NAME in df.columns:
                 ledger_names |= set(df[COL_LEDGER_LIST_NAME].dropna().map(str).str.strip())
 
-            # LE list
+            # Legal Entities (catalog)
             df = _read_csv_from_zip(z, FN_LE_PROFILE)
             if df is not None and COL_LE_PROFILE_NAME in df.columns:
                 legal_entity_names |= set(df[COL_LE_PROFILE_NAME].dropna().map(str).str.strip())
@@ -93,7 +100,7 @@ def build_ledger_le_bu_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFrame:
             df = _read_csv_from_zip(z, FN_BUSINESS_UNITS)
             if df is not None and {COL_BU_NAME, COL_BU_LEDGER, COL_BU_LENAME}.issubset(df.columns):
                 for _, r in df[[COL_BU_NAME, COL_BU_LEDGER, COL_BU_LENAME]].iterrows():
-                    bu = _norm(r[COL_BU_NAME])
+                    bu  = _norm(r[COL_BU_NAME])
                     led = _norm(r[COL_BU_LEDGER])
                     le  = _norm(r[COL_BU_LENAME])
                     bu_rows.append({"Name": bu, "PrimaryLedgerName": led, "LegalEntityName": le})
@@ -111,7 +118,7 @@ def build_ledger_le_bu_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFrame:
         for le in les:
             le_to_ledgers.setdefault(le, set()).add(led)
 
-    # Build final rows (OG approach)
+    # Build final rows
     rows = []
     seen_triples = set()
     seen_ledgers_with_bu = set()
@@ -162,14 +169,11 @@ def build_ledger_le_bu_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFrame:
     df = df.sort_values(["__empty","Ledger","LegalEntityName","BusinessUnitName"]).drop(columns="__empty").reset_index(drop=True)
     return df
 
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Build ES – Ledger–LE–CostOrg
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def build_ledger_le_costorg_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFrame:
-    # Collect required frames
-    parts_cost = []
-    parts_ident_ledger = []
-    parts_ident_lename = []
+    parts_cost, parts_ident_ledger, parts_ident_lename = [], [], []
 
     for blob in zip_bytes_list:
         with zipfile.ZipFile(io.BytesIO(blob)) as z:
@@ -204,15 +208,14 @@ def build_ledger_le_costorg_from_zips(zip_bytes_list: List[bytes]) -> pd.DataFra
 
     out = (df_cost.merge(df_in, on="LegalEntityIdentifier", how="left")
                   .merge(df_il, on="LegalEntityIdentifier", how="left"))
-    # Only the 3 columns you asked for
     out = out[["Ledger","LegalEntityName","CostOrganization"]].fillna("").sort_values(
         ["Ledger","LegalEntityName","CostOrganization"], na_position="last"
     ).reset_index(drop=True)
     return out
 
-# -----------------------------
-# Workbook writer (two tabs)
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Workbook writer (exactly two tabs)
+# ──────────────────────────────────────────────────────────────────────────────
 def two_tab_workbook_bytes(df_bu: pd.DataFrame, df_co: pd.DataFrame) -> bytes:
     wb = Workbook()
     ws1 = wb.active
@@ -231,9 +234,9 @@ def two_tab_workbook_bytes(df_bu: pd.DataFrame, df_co: pd.DataFrame) -> bytes:
     out.seek(0)
     return out.read()
 
-# -----------------------------
-# Diagram (yellow BU, blue Cost Org)
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Diagram (yellow BU, blue Cost Org) + link
+# ──────────────────────────────────────────────────────────────────────────────
 def drawio_from_frames(df_bu: pd.DataFrame, df_co: pd.DataFrame) -> str:
     # normalize
     for df, cols in [(df_bu,["Ledger","LegalEntityName","BusinessUnitName"]),
@@ -256,19 +259,26 @@ def drawio_from_frames(df_bu: pd.DataFrame, df_co: pd.DataFrame) -> str:
     S_LE_CO     = S_BASE + "strokeColor=#1F75FE;strokeWidth=2;"   # blue
 
     class G:
-        def __init__(self, name="Enterprise Structure"):
+        def __init__(self, name="Enterprise Structure (+ Cost Orgs)"):
             self.cells=[{"id":"0"},{"id":"1","parent":"0"}]; self.name=name
         def add_node(self,label,x,y,w,h,sty):
-            i=uuid.uuid4().hex[:10]; self.cells.append({"id":i,"value":label,"vertex":"1","parent":"1",
-                "style":f"whiteSpace=wrap;html=1;align=center;{sty}","geometry":{"x":x,"y":y,"width":w,"height":h}}); return i
+            i=uuid.uuid4().hex[:10]
+            self.cells.append({"id":i,"value":label,"vertex":"1","parent":"1",
+                "style":f"whiteSpace=wrap;html=1;align=center;{sty}",
+                "geometry":{"x":x,"y":y,"width":w,"height":h}})
+            return i
         def add_edge(self,s,t,sty):
-            i=uuid.uuid4().hex[:10]; self.cells.append({"id":i,"edge":"1","parent":"1","style":sty,"source":s,"target":t}); return i
+            i=uuid.uuid4().hex[:10]
+            self.cells.append({"id":i,"edge":"1","parent":"1","style":sty,"source":s,"target":t})
+            return i
         def xml(self):
             mx=ET.Element("mxGraphModel"); root=ET.SubElement(mx,"root")
             for c in self.cells:
-                a={k:v for k,v in c.items() if k!="geometry"}; cell=ET.SubElement(root,"mxCell",a)
+                a={k:v for k,v in c.items() if k!="geometry"}
+                cell=ET.SubElement(root,"mxCell",a)
                 if "geometry" in c:
-                    g=c["geometry"]; ET.SubElement(cell,"mxGeometry",{"x":str(g["x"]),"y":str(g["y"]),
+                    g=c["geometry"]
+                    ET.SubElement(cell,"mxGeometry",{"x":str(g["x"]),"y":str(g["y"]),
                         "width":str(g["width"]),"height":str(g["height"]),"as":"geometry"})
             enc=_deflate_base64(ET.tostring(mx,encoding="utf-8").decode("utf-8"))
             mxfile=ET.Element("mxfile",{"host":"app.diagrams.net"})
@@ -276,7 +286,7 @@ def drawio_from_frames(df_bu: pd.DataFrame, df_co: pd.DataFrame) -> str:
             diagram.text=enc
             return ET.tostring(mxfile,encoding="utf-8",xml_declaration=True).decode("utf-8")
 
-    g = G("Enterprise Structure (+ Cost Orgs)")
+    g = G()
 
     ledgers = sorted(set(df_bu["Ledger"]) | set(df_co["Ledger"]))
     if not ledgers: ledgers = [""]
@@ -328,18 +338,20 @@ def drawio_link_from_xml(xml: str) -> str:
     b64 = base64.b64encode(raw).decode("ascii")
     return f"https://app.diagrams.net/?title=EnterpriseStructure.drawio#R{b64}"
 
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # UI
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     zips = st.file_uploader("Oracle Export ZIPs", type=["zip"], accept_multiple_files=True)
     run = st.button("Build")
 
-st.caption("I’ll output **one Excel** with exactly two tabs and a **diagram link**. "
-           "Files I expect across your ZIPs: "
-           "`GL_PRIMARY_LEDGER.csv`, `XLE_ENTITY_PROFILE.csv`, "
-           "`ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv`, `ORA_GL_JOURNAL_CONFIG_DETAIL.csv`, "
-           "`FUN_BUSINESS_UNIT.csv` (optional), `CST_COST_ORGANIZATION.csv`.")
+st.caption(
+    "I’ll output **one Excel** with exactly two tabs and a **diagram link**. "
+    "Files I expect across your ZIPs: "
+    "`GL_PRIMARY_LEDGER.csv`, `XLE_ENTITY_PROFILE.csv`, "
+    "`ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv`, `ORA_GL_JOURNAL_CONFIG_DETAIL.csv`, "
+    "`FUN_BUSINESS_UNIT.csv` (optional), `CST_COST_ORGANIZATION.csv`."
+)
 
 if run:
     if not zips:
@@ -375,7 +387,7 @@ if run:
             st.success("🔗 Open in draw.io:")
             st.markdown(f"[**Open Diagram in diagrams.net**]({link})")
 
-        # Optional previews (collapsed by default)
+        # Optional previews
         with st.expander("Preview: ES – Ledger–LE–BU (first 30)"):
             st.dataframe(df_bu.head(30))
         with st.expander("Preview: ES – Ledger–LE–CostOrg (first 30)"):
