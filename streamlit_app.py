@@ -251,3 +251,180 @@ else:
         file_name="EnterpriseStructure.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+# ===================== DRAW.IO DIAGRAM BLOCK =====================
+if "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty:
+    import xml.etree.ElementTree as ET
+    import zlib, base64, uuid
+
+    def _make_drawio_xml(df_bu: pd.DataFrame, df_co: pd.DataFrame) -> str:
+        # --- layout & spacing ---
+        W, H       = 180, 48
+        X_STEP     = 230
+        PAD_GROUP  = 60
+        LEFT_PAD   = 260
+        RIGHT_PAD  = 160
+
+        Y_LEDGER   = 150
+        Y_LE       = 310
+        Y_BU       = 470
+        Y_CO       = 630   # cost orgs row, below BUs
+
+        # --- styles ---
+        S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
+        S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
+        S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
+        S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#E2F7E2;strokeColor=#3D8B3D;fontSize=12;"
+
+        S_EDGE = (
+            "endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
+            "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;"
+        )
+
+        # --- normalize input ---
+        df_bu = df_bu[["Ledger Name", "Legal Entity", "Business Unit"]].copy()
+        df_co = df_co[["Ledger Name", "Legal Entity", "Cost Organization"]].copy()
+        for df in (df_bu, df_co):
+            for c in df.columns:
+                df[c] = df[c].fillna("").map(str).str.strip()
+
+        ledgers = sorted([x for x in set(df_bu["Ledger Name"]) | set(df_co["Ledger Name"]) if x])
+        le_map = {}  # {ledger: set(LEs)}
+        for _, r in pd.concat([df_bu, df_co]).iterrows():
+            if r["Ledger Name"] and r["Legal Entity"]:
+                le_map.setdefault(r["Ledger Name"], set()).add(r["Legal Entity"])
+
+        bu_map = {}  # {(ledger, le): set(BUs)}
+        for _, r in df_bu.iterrows():
+            if r["Ledger Name"] and r["Legal Entity"] and r["Business Unit"]:
+                bu_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Business Unit"])
+
+        co_map = {}  # {(ledger, le): set(COs)}
+        for _, r in df_co.iterrows():
+            if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"]:
+                co_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Cost Organization"])
+
+        # --- x-coordinates ---
+        next_x = LEFT_PAD
+        led_x, le_x, bu_x, co_x = {}, {}, {}, {}
+
+        for L in ledgers:
+            les = sorted(le_map.get(L, []))
+            for le in les:
+                buses = sorted(bu_map.get((L, le), []))
+                cos   = sorted(co_map.get((L, le), []))
+                all_children = buses + cos if (buses or cos) else [le]
+
+                for child in all_children:
+                    if child not in bu_x and child not in co_x:
+                        if child in buses:
+                            bu_x[child] = next_x
+                        else:
+                            co_x[child] = next_x
+                        next_x += X_STEP
+                if buses or cos:
+                    xs = []
+                    if buses: xs += [bu_x[b] for b in buses]
+                    if cos:   xs += [co_x[c] for c in cos]
+                    le_x[(L, le)] = int(sum(xs)/len(xs))
+                else:
+                    le_x[(L, le)] = next_x
+                    next_x += X_STEP
+            if les:
+                xs = [le_x[(L, le)] for le in les]
+                led_x[L] = int(sum(xs)/len(xs))
+            else:
+                led_x[L] = next_x
+                next_x += X_STEP
+            next_x += PAD_GROUP
+
+        # --- XML skeleton ---
+        mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
+        diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
+        model   = ET.SubElement(diagram, "mxGraphModel", attrib={
+            "dx": "1284", "dy": "682", "grid": "1", "gridSize": "10",
+            "page": "1", "pageWidth": "1920", "pageHeight": "1080",
+            "background": "#ffffff"
+        })
+        root    = ET.SubElement(model, "root")
+        ET.SubElement(root, "mxCell", attrib={"id": "0"})
+        ET.SubElement(root, "mxCell", attrib={"id": "1", "parent": "0"})
+
+        def add_vertex(label, style, x, y):
+            vid = uuid.uuid4().hex[:8]
+            c = ET.SubElement(root, "mxCell", attrib={
+                "id": vid, "value": label, "style": style, "vertex": "1", "parent": "1"})
+            ET.SubElement(c, "mxGeometry", attrib={
+                "x": str(int(x)), "y": str(int(y)), "width": str(W), "height": str(H), "as": "geometry"})
+            return vid
+
+        def add_edge(src, tgt):
+            eid = uuid.uuid4().hex[:8]
+            c = ET.SubElement(root, "mxCell", attrib={
+                "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
+                "source": src, "target": tgt})
+            ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
+
+        # --- vertices ---
+        id_map = {}
+        for L in ledgers:
+            id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
+            for le in sorted(le_map.get(L, [])):
+                id_map[("E", L, le)] = add_vertex(le, S_LE, le_x[(L, le)], Y_LE)
+                for b in sorted(bu_map.get((L, le), [])):
+                    id_map[("B", L, le, b)] = add_vertex(b, S_BU, bu_x[b], Y_BU)
+                for c in sorted(co_map.get((L, le), [])):
+                    id_map[("C", L, le, c)] = add_vertex(c, S_CO, co_x[c], Y_CO)
+
+        # --- edges ---
+        for L in ledgers:
+            for le in sorted(le_map.get(L, [])):
+                # LE → Ledger
+                if ("E", L, le) in id_map and ("L", L) in id_map:
+                    add_edge(id_map[("E", L, le)], id_map[("L", L)])
+                # BU → LE
+                for b in sorted(bu_map.get((L, le), [])):
+                    if ("B", L, le, b) in id_map:
+                        add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
+                # CO → LE
+                for c in sorted(co_map.get((L, le), [])):
+                    if ("C", L, le, c) in id_map:
+                        add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
+
+        # Legend
+        def add_legend(x=20, y=20):
+            def swatch(lbl, color, ty, offset):
+                box = ET.SubElement(root, "mxCell", attrib={
+                    "id": uuid.uuid4().hex[:8], "value": "",
+                    "style": f"rounded=1;fillColor={color};strokeColor=#666666;",
+                    "vertex": "1", "parent": "1"})
+                ET.SubElement(box, "mxGeometry", attrib={
+                    "x": str(x+12), "y": str(y+offset), "width": "18", "height": "12", "as": "geometry"})
+                txt = ET.SubElement(root, "mxCell", attrib={
+                    "id": uuid.uuid4().hex[:8], "value": lbl,
+                    "style": "text;align=left;verticalAlign=middle;fontSize=12;",
+                    "vertex": "1", "parent": "1"})
+                ET.SubElement(txt, "mxGeometry", attrib={
+                    "x": str(x+36), "y": str(y+offset-4), "width": "130", "height": "20", "as": "geometry"})
+            swatch("Ledger", "#FFE6E6", "L", 36)
+            swatch("Legal Entity", "#FFE2C2", "E", 62)
+            swatch("Business Unit", "#FFF1B3", "B", 88)
+            swatch("Cost Org", "#E2F7E2", "C", 114)
+
+        add_legend()
+        return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
+
+    def _drawio_url_from_xml(xml: str) -> str:
+        raw = zlib.compress(xml.encode("utf-8"), level=9)[2:-4]
+        b64 = base64.b64encode(raw).decode("ascii")
+        return f"https://app.diagrams.net/?title=EnterpriseStructure.drawio#R{b64}"
+
+    _xml = _make_drawio_xml(df1, df2)
+
+    st.download_button(
+        "⬇️ Download diagram (.drawio)",
+        data=_xml.encode("utf-8"),
+        file_name="EnterpriseStructure.drawio",
+        mime="application/xml",
+        use_container_width=True
+    )
+    st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
