@@ -1,418 +1,355 @@
-import io, zipfile, base64, zlib, uuid
+import io
+import zlib
+import base64
+import uuid
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook, load_workbook
 import xml.etree.ElementTree as ET
 
-st.set_page_config(page_title="Enterprise Structure Generator 2", page_icon="🧭", layout="wide")
-st.title("Enterprise Structure Generator 2 — Core + Cost Org (separate vertical, arrows upward)")
+st.set_page_config(page_title="Enterprise Structure + Cost Orgs", layout="wide")
 
+# =========================
+# Utilities
+# =========================
+
+def _deflate_base64(xml_text: str) -> str:
+    """Deflate (zlib) + base64 encode, with no zlib header (raw)."""
+    compressor = zlib.compressobj(level=9, wbits=-15)
+    compressed = compressor.compress(xml_text.encode("utf-8")) + compressor.flush()
+    return base64.b64encode(compressed).decode("ascii")
+
+def _new_id() -> str:
+    return str(uuid.uuid4()).replace("-", "")[:12]
+
+# =========================
+# Graph Builder for draw.io
+# =========================
+
+class GraphBuilder:
+    """
+    Minimal mxGraph builder that produces a .drawio (mxfile) with one diagram.
+    Handles nodes as mxCell vertices and edges with styles.
+    Coordinates are absolute; we keep parent as the root layer.
+    """
+    def __init__(self, name: str = "ES Diagram"):
+        self.name = name
+        self.root_id = "0"
+        self.layer_id = "1"
+        self.cells = []  # list of dicts representing mxCell attrs
+        self.node_ids = set()
+
+        # create root + layer cells
+        self.cells.append({
+            "id": self.root_id,
+        })
+        self.cells.append({
+            "id": self.layer_id,
+            "parent": self.root_id
+        })
+
+    def add_node(self, label: str, x: int, y: int, w: int, h: int, style: str = "") -> str:
+        cid = _new_id()
+        self.node_ids.add(cid)
+        self.cells.append({
+            "id": cid,
+            "value": label,
+            "style": f"whiteSpace=wrap;html=1;align=center;{style}",
+            "vertex": "1",
+            "parent": self.layer_id,
+            "geometry": {"x": x, "y": y, "width": w, "height": h}
+        })
+        return cid
+
+    def add_edge(self, src: str, dst: str, style: str = "") -> str:
+        eid = _new_id()
+        self.cells.append({
+            "id": eid,
+            "edge": "1",
+            "parent": self.layer_id,
+            "style": style,
+            "source": src,
+            "target": dst
+        })
+        return eid
+
+    def to_mxgraphmodel_xml(self) -> str:
+        """
+        Build <mxGraphModel><root>...</root></mxGraphModel> XML string.
+        """
+        mxGraphModel = ET.Element("mxGraphModel")
+        root = ET.SubElement(mxGraphModel, "root")
+
+        # write cells
+        for c in self.cells:
+            mxCell = ET.SubElement(root, "mxCell", {k: v for k, v in c.items()
+                                                    if k not in ("geometry",)})
+            if "geometry" in c:
+                g = c["geometry"]
+                ET.SubElement(mxCell, "mxGeometry", {
+                    "x": str(g["x"]), "y": str(g["y"]),
+                    "width": str(g["width"]), "height": str(g["height"]),
+                    "as": "geometry"
+                })
+        return ET.tostring(mxGraphModel, encoding="utf-8", xml_declaration=False).decode("utf-8")
+
+    def to_drawio_xml(self) -> str:
+        """
+        Wrap mxGraphModel in <mxfile><diagram>compressed</diagram></mxfile>.
+        """
+        inner = self.to_mxgraphmodel_xml()
+        enc = _deflate_base64(inner)
+        mxfile = ET.Element("mxfile", {"host": "app.diagrams.net"})
+        diagram = ET.SubElement(mxfile, "diagram", {"name": self.name, "id": _new_id()})
+        diagram.text = enc
+        return ET.tostring(mxfile, encoding="utf-8", xml_declaration=True).decode("utf-8")
+
+# =========================
+# Core data builders
+# =========================
+
+REQUIRED_CO_COLS = {"Name", "LegalEntityIdentifier"}
+REQUIRED_LE_COLS = {"Identifier", "Name"}
+
+def load_cost_orgs(cost_org_csv: io.BytesIO, legal_entities_csv: io.BytesIO) -> pd.DataFrame:
+    df_co = pd.read_csv(cost_org_csv, dtype=str).rename(columns=lambda c: c.strip())
+    df_le = pd.read_csv(legal_entities_csv, dtype=str).rename(columns=lambda c: c.strip())
+
+    missing_co = REQUIRED_CO_COLS - set(df_co.columns)
+    missing_le = REQUIRED_LE_COLS - set(df_le.columns)
+    if missing_co:
+        raise ValueError(f"CST_COST_ORGANIZATION.csv missing columns: {missing_co}")
+    if missing_le:
+        raise ValueError(f"LEGAL_ENTITIES.csv missing columns: {missing_le}")
+
+    df_le = df_le.rename(columns={"Name": "LegalEntityName",
+                                  "Identifier": "LegalEntityIdentifier"})
+
+    # Try to locate ledger column if present
+    ledger_guess = None
+    for c in df_le.columns:
+        lc = c.lower()
+        if lc in ("ledger", "ledgername", "primaryledger", "ledger_name"):
+            ledger_guess = c
+            break
+    if ledger_guess:
+        df_le = df_le.rename(columns={ledger_guess: "Ledger"})
+    else:
+        df_le["Ledger"] = ""
+
+    df = (df_co.rename(columns={"Name": "CostOrganization"})
+                .merge(df_le[["LegalEntityIdentifier", "LegalEntityName", "Ledger"]],
+                       on="LegalEntityIdentifier", how="left"))
+
+    return df[["Ledger", "LegalEntityIdentifier", "LegalEntityName", "CostOrganization"]]
+
+def build_cost_org_tab(xlsx_bytes_or_none, df_cost: pd.DataFrame,
+                       out_sheet_name: str = "ES – Ledger–LE–CostOrg") -> bytes:
+    """
+    Writes/overwrites the cost-org mapping sheet into supplied workbook (if provided),
+    else builds a new workbook with only that sheet. Returns bytes of the workbook.
+    """
+    df = df_cost.copy()
+    df["__WARN_UnmappedLE"] = df["LegalEntityName"].isna() | (df["LegalEntityName"] == "")
+    df = df[["Ledger", "LegalEntityName", "CostOrganization", "LegalEntityIdentifier", "__WARN_UnmappedLE"]]
+    df = df.sort_values(["Ledger", "LegalEntityName", "CostOrganization"],
+                        na_position="last").reset_index(drop=True)
+
+    output = io.BytesIO()
+    if xlsx_bytes_or_none:
+        # load and replace sheet
+        wb = load_workbook(filename=io.BytesIO(xlsx_bytes_or_none))
+        if out_sheet_name in wb.sheetnames:
+            ws = wb[out_sheet_name]
+            wb.remove(ws)
+        ws = wb.create_sheet(out_sheet_name)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = out_sheet_name
+
+    # write headers
+    headers = list(df.columns)
+    ws.append(headers)
+    for _, row in df.iterrows():
+        ws.append(list(row.values))
+
+    wb.save(output)
+    output.seek(0)
+    return output.read()
+
+# =========================
+# Diagram wiring
+# =========================
+
+# Layout constants (tweak if your canvases are wider)
+X_LEDGER = 40
+X_LE     = 320
+X_BU     = 650
+X_CO     = 950
+
+Y_START_LEDGER = 40
+Y_START_LE     = 40
+Y_START_BU     = 40
+Y_START_CO     = 220   # lower baseline so Cost Orgs sit below BUs
+
+Y_STEP = 90
+NODE_W, NODE_H = 170, 48
+
+STYLE_NODE_LEDGER = "rounded=1;fillColor=#F5F5F5;strokeColor=#666666;fontStyle=1;"
+STYLE_NODE_LE     = "rounded=1;fillColor=#FFFFFF;strokeColor=#222222;"
+STYLE_NODE_BU     = "rounded=1;fillColor=#FFFFFF;strokeColor=#888888;"
+STYLE_NODE_CO     = "rounded=1;fillColor=#E9F2FF;strokeColor=#1F75FE;"
+
+STYLE_EDGE_BASE = "endArrow=block;endFill=1;rounded=1;jettySize=auto;orthogonalLoop=1;edgeStyle=orthogonalEdgeStyle;curved=1;jumpStyle=arc;jumpSize=10;"
+STYLE_LEDGER_TO_LE = STYLE_EDGE_BASE + "strokeColor=#666666;strokeWidth=2;"
+STYLE_LE_TO_BU     = STYLE_EDGE_BASE + "strokeColor=#FFD400;strokeWidth=2;"   # yellow
+STYLE_LE_TO_CO     = STYLE_EDGE_BASE + "strokeColor=#1F75FE;strokeWidth=2;"   # blue
+
+def build_diagram(df_ledger_le_bu: pd.DataFrame,
+                  df_cost: pd.DataFrame) -> str:
+    """
+    df_ledger_le_bu must have columns: Ledger, LegalEntityName, BusinessUnitName
+    df_cost must have columns: Ledger, LegalEntityName, CostOrganization
+    Returns .drawio XML string.
+    """
+    g = GraphBuilder(name="Enterprise Structure (with Cost Orgs)")
+
+    # --- Place Ledgers
+    ledger_node_ids = {}
+    y = Y_START_LEDGER
+    for ledger in sorted(set(df_ledger_le_bu["Ledger"].dropna()) | set(df_cost["Ledger"].dropna())):
+        label = ledger if pd.notna(ledger) and ledger != "" else "(No Ledger)"
+        nid = g.add_node(label=label, x=X_LEDGER, y=y, w=NODE_W, h=NODE_H, style=STYLE_NODE_LEDGER)
+        ledger_node_ids[label] = nid
+        y += Y_STEP
+
+    # --- Place LEs (group by ledger)
+    le_node_ids = {}
+    # Ensure LE rows exist from either frame
+    df_le_all = (pd.concat([
+                    df_ledger_le_bu[["Ledger", "LegalEntityName"]],
+                    df_cost[["Ledger", "LegalEntityName"]]
+                 ], ignore_index=True)
+                 .drop_duplicates()
+                 .sort_values(["Ledger", "LegalEntityName"], na_position="last"))
+
+    last_ledger = None
+    y_le = Y_START_LE
+    for _, r in df_le_all.iterrows():
+        ledger = r.get("Ledger") if pd.notna(r.get("Ledger")) else "(No Ledger)"
+        le     = r.get("LegalEntityName") if pd.notna(r.get("LegalEntityName")) else "(Unnamed LE)"
+        if ledger != last_ledger:
+            y_le = Y_START_LE
+            last_ledger = ledger
+        nid = g.add_node(label=le, x=X_LE, y=y_le, w=NODE_W, h=NODE_H, style=STYLE_NODE_LE)
+        le_node_ids[(ledger, le)] = nid
+        # edge Ledger -> LE
+        g.add_edge(src=ledger_node_ids.get(ledger, list(ledger_node_ids.values())[0]),
+                   dst=nid, style=STYLE_LEDGER_TO_LE)
+        y_le += Y_STEP
+
+    # --- Place BUs (group by LE)
+    bu_node_ids = {}
+    if not df_ledger_le_bu.empty:
+        for (ledger, le), grp in df_ledger_le_bu.groupby(["Ledger", "LegalEntityName"], dropna=False):
+            y_bu = Y_START_BU
+            for bu in sorted(set(grp["BusinessUnitName"].dropna())):
+                bu_label = bu if bu else "(Unnamed BU)"
+                nid = g.add_node(label=bu_label, x=X_BU, y=y_bu, w=NODE_W, h=NODE_H, style=STYLE_NODE_BU)
+                bu_node_ids[(ledger or "(No Ledger)", le or "(Unnamed LE)", bu_label)] = nid
+                # edge LE -> BU (yellow)
+                g.add_edge(src=le_node_ids[(ledger or "(No Ledger)", le or "(Unnamed LE)")],
+                           dst=nid, style=STYLE_LE_TO_BU)
+                y_bu += Y_STEP
+
+    # --- Place Cost Orgs (lower layer)
+    co_node_ids = {}
+    if not df_cost.empty:
+        for (ledger, le), grp in df_cost.groupby(["Ledger", "LegalEntityName"], dropna=False):
+            y_co = Y_START_CO
+            for co in sorted(set(grp["CostOrganization"].dropna())):
+                co_label = co if co else "(Unnamed Cost Org)"
+                nid = g.add_node(label=co_label, x=X_CO, y=y_co, w=NODE_W, h=NODE_H, style=STYLE_NODE_CO)
+                co_node_ids[(ledger or "(No Ledger)", le or "(Unnamed LE)", co_label)] = nid
+                # edge LE -> Cost Org (blue)
+                g.add_edge(src=le_node_ids[(ledger or "(No Ledger)", le or "(Unnamed LE)")],
+                           dst=nid, style=STYLE_LE_TO_CO)
+                y_co += Y_STEP
+
+    return g.to_drawio_xml()
+
+# =========================
+# Streamlit UI
+# =========================
+
+st.title("Enterprise Structure Generator — Increment: Cost Organizations")
+st.caption("Adds a second tab (Ledger–LE–CostOrg) and a diagram layer with LE→Cost Org (blue) edges. BU remains yellow, Cost Orgs sit lower vertically.")
+
+with st.sidebar:
+    st.header("Inputs")
+    xlsx_file = st.file_uploader("(Optional) Existing ES Workbook (.xlsx)", type=["xlsx"])
+    le_bu_csv = st.file_uploader("Ledger–LE–BU CSV (columns: Ledger, LegalEntityName, BusinessUnitName)", type=["csv"])
+    cost_org_csv = st.file_uploader("CST_COST_ORGANIZATION.csv", type=["csv"])
+    legal_entities_csv = st.file_uploader("MANAGE_LEGAL_ENTITIES.csv", type=["csv"])
+
+    run = st.button("Build Tab + Diagram")
+
+# Hints
 st.markdown("""
-**Uploads (any order):**
-- **Core**: `GL_PRIMARY_LEDGER.csv`, `XLE_ENTITY_PROFILE.csv`,
-  `ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv`, `ORA_GL_JOURNAL_CONFIG_DETAIL.csv`, `FUN_BUSINESS_UNIT.csv`
-- **Costing**: `CST_COST_ORGANIZATION.csv` (Name, LegalEntityIdentifier, OrgInformation2),
-  `CST_COST_ORG_BOOK.csv` (**Name = Ledger**, `ORA_CST_ACCT_COST_ORG.CostOrgCode` = CostOrgKey)
+**Expected columns**  
+- *CST_COST_ORGANIZATION.csv*: `Name`, `LegalEntityIdentifier`  
+- *MANAGE_LEGAL_ENTITIES.csv*: `Identifier`, `Name`, and ideally a `Ledger` column (or `LedgerName` / `PrimaryLedger`)  
+- *Ledger–LE–BU CSV*: `Ledger`, `LegalEntityName`, `BusinessUnitName`
 """)
 
-uploads = st.file_uploader("Drop Oracle export ZIPs", type="zip", accept_multiple_files=True)
+if run:
+    # Validate mandatory files
+    if not cost_org_csv or not legal_entities_csv:
+        st.error("Please upload both **CST_COST_ORGANIZATION.csv** and **MANAGE_LEGAL_ENTITIES.csv**.")
+        st.stop()
+    if not le_bu_csv:
+        st.warning("No Ledger–LE–BU CSV provided. Diagram will include Ledgers and LEs and skip BUs.")
 
-# ----------------- helpers -----------------
-def read_csv_from_zip(zf, name):
-    if name not in zf.namelist():
-        return None
-    with zf.open(name) as fh:
-        return pd.read_csv(fh, dtype=str)
-
-def _drawio_url_from_xml(xml: str) -> str:
-    raw = zlib.compress(xml.encode("utf-8"), level=9)[2:-4]  # raw DEFLATE
-    b64 = base64.b64encode(raw).decode("ascii")
-    return f"https://app.diagrams.net/?title=EnterpriseStructure.drawio#R{b64}"
-
-# ----------------- ingestion -----------------
-if not uploads:
-    st.info("Upload your ZIPs to generate outputs.")
-    st.stop()
-
-# Core collectors
-ledger_names = set()
-legal_entity_names = set()
-ledger_to_idents = {}
-ident_to_le_name = {}
-bu_rows = []
-
-# Costing collectors
-costorg_rows = []      # from CST_COST_ORGANIZATION.csv :: Name, LegalEntityIdentifier, OrgInformation2
-code_to_ledger = {}    # from CST_COST_ORG_BOOK.csv    :: ORA_CST_ACCT_COST_ORG.CostOrgCode -> Name (Ledger)
-
-for up in uploads:
     try:
-        z = zipfile.ZipFile(up)
-    except Exception as e:
-        st.error(f"Could not open `{up.name}` as a ZIP: {e}")
-        continue
+        # Load frames
+        df_cost = load_cost_orgs(cost_org_csv, legal_entities_csv)
 
-    # Ledgers
-    df = read_csv_from_zip(z, "GL_PRIMARY_LEDGER.csv")
-    if df is not None:
-        col = "ORA_GL_PRIMARY_LEDGER_CONFIG.Name"
-        if col in df.columns:
-            ledger_names |= set(df[col].dropna().map(str).str.strip())
-
-    # Legal Entities
-    df = read_csv_from_zip(z, "XLE_ENTITY_PROFILE.csv")
-    if df is not None and "Name" in df.columns:
-        legal_entity_names |= set(df["Name"].dropna().map(str).str.strip())
-
-    # Ledger ↔ LE identifier
-    df = read_csv_from_zip(z, "ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv")
-    if df is not None and {"GL_LEDGER.Name","LegalEntityIdentifier"} <= set(df.columns):
-        for _, r in df[["GL_LEDGER.Name","LegalEntityIdentifier"]].dropna().iterrows():
-            ledger_to_idents.setdefault(str(r["GL_LEDGER.Name"]).strip(), set()).add(str(r["LegalEntityIdentifier"]).strip())
-
-    # Identifier ↔ LE name
-    df = read_csv_from_zip(z, "ORA_GL_JOURNAL_CONFIG_DETAIL.csv")
-    if df is not None and {"LegalEntityIdentifier","ObjectName"} <= set(df.columns):
-        for _, r in df[["LegalEntityIdentifier","ObjectName"]].dropna().iterrows():
-            ident_to_le_name[str(r["LegalEntityIdentifier"]).strip()] = str(r["ObjectName"]).strip()
-
-    # Business Units
-    df = read_csv_from_zip(z, "FUN_BUSINESS_UNIT.csv")
-    if df is not None and {"Name","PrimaryLedgerName","LegalEntityName"} <= set(df.columns):
-        t = df[["Name","PrimaryLedgerName","LegalEntityName"]].fillna("").astype(str).applymap(lambda x: x.strip())
-        bu_rows += t.to_dict(orient="records")
-
-    # Cost Org master
-    df = read_csv_from_zip(z, "CST_COST_ORGANIZATION.csv")
-    if df is not None and {"Name","LegalEntityIdentifier","OrgInformation2"} <= set(df.columns):
-        t = df[["Name","LegalEntityIdentifier","OrgInformation2"]].fillna("").astype(str).applymap(lambda x: x.strip())
-        t = t.rename(columns={"Name":"CostOrgName","LegalEntityIdentifier":"LE_Ident","OrgInformation2":"CostOrgCode"})
-        costorg_rows += t.to_dict(orient="records")
-
-    # Cost Org → Ledger (authoritative)
-    df = read_csv_from_zip(z, "CST_COST_ORG_BOOK.csv")
-    if df is not None and {"ORA_CST_ACCT_COST_ORG.CostOrgCode","Name"} <= set(df.columns):
-        for _, r in df[["ORA_CST_ACCT_COST_ORG.CostOrgCode","Name"]].dropna().iterrows():
-            code = str(r["ORA_CST_ACCT_COST_ORG.CostOrgCode"]).strip()
-            ledger = str(r["Name"]).strip()  # in your export, 'Name' is the GL Ledger
-            if code and ledger:
-                code_to_ledger.setdefault(code, set()).add(ledger)
-
-# ----------------- Sheet 1 (Ledger–LE–BU) with **no duplicate (L,LE) if BU exists** -----------------
-# Build Ledger → LE (from identifiers)
-ledger_to_le_names = {}
-for led, idents in ledger_to_idents.items():
-    for ident in idents:
-        le_name = ident_to_le_name.get(ident, "").strip()
-        if le_name:
-            ledger_to_le_names.setdefault(led, set()).add(le_name)
-
-# Collect BUs per (Ledger, LE)
-bu_map = {}  # (L,E) -> set(BU)
-for r in bu_rows:
-    L = r["PrimaryLedgerName"].strip()
-    E = r["LegalEntityName"].strip()
-    B = r["Name"].strip()
-    if L and E and B:
-        bu_map.setdefault((L,E), set()).add(B)
-
-rows_core = []
-# For each ledger & LE we know about, either output all BUs OR a single L-LE without BU
-for L, le_set in ledger_to_le_names.items():
-    for E in sorted(le_set):
-        buses = sorted(list(bu_map.get((L,E), set())))
-        if buses:
-            for B in buses:
-                rows_core.append({"Ledger Name": L, "Legal Entity": E, "Business Unit": B})
+        if le_bu_csv:
+            df_le_bu = pd.read_csv(le_bu_csv, dtype=str).rename(columns=lambda c: c.strip())
+            need = {"Ledger", "LegalEntityName", "BusinessUnitName"}
+            missing = need - set(df_le_bu.columns)
+            if missing:
+                st.error(f"Ledger–LE–BU CSV missing columns: {missing}")
+                st.stop()
         else:
-            rows_core.append({"Ledger Name": L, "Legal Entity": E, "Business Unit": ""})
+            # build minimal frame with whatever ledgers/LEs exist from cost-org file
+            df_le_bu = (df_cost[["Ledger", "LegalEntityName"]].drop_duplicates())
+            df_le_bu["BusinessUnitName"] = pd.NA
 
-# Orphan Ledgers (no LE at all)
-for L in sorted(ledger_names - set(ledger_to_le_names.keys())):
-    rows_core.append({"Ledger Name": L, "Legal Entity": "", "Business Unit": ""})
+        # Build/Update workbook tab
+        xlsx_in_bytes = xlsx_file.read() if xlsx_file is not None else None
+        wb_bytes = build_cost_org_tab(xlsx_in_bytes, df_cost, out_sheet_name="ES – Ledger–LE–CostOrg")
 
-# Orphan LEs (never appear under any ledger in the core files)
-present_les = {r["Legal Entity"] for r in rows_core if r["Legal Entity"]}
-for E in sorted(legal_entity_names - present_les):
-    rows_core.append({"Ledger Name": "", "Legal Entity": E, "Business Unit": ""})
+        st.success("Workbook tab created.")
+        st.download_button("⬇️ Download updated workbook", data=wb_bytes,
+                           file_name="enterprise_structure.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-df_core = pd.DataFrame(rows_core).drop_duplicates().reset_index(drop=True)
-# Order: non-empty ledger first, then LE, then BU
-df_core["__LedgerEmpty"] = (df_core["Ledger Name"] == "").astype(int)
-df_core = df_core.sort_values(
-    ["__LedgerEmpty","Ledger Name","Legal Entity","Business Unit"],
-    ascending=[True,True,True,True]
-).drop(columns="__LedgerEmpty").reset_index(drop=True)
+        # Build diagram
+        drawio_xml = build_diagram(df_ledger_le_bu=df_le_bu, df_cost=df_cost)
+        st.success("Diagram generated.")
+        st.download_button("⬇️ Download .drawio diagram", data=drawio_xml.encode("utf-8"),
+                           file_name="enterprise_structure.drawio", mime="application/xml")
 
-st.success(f"Sheet 1 (Core): {len(df_core)} rows (no duplicate L–LE when BUs exist)")
-st.dataframe(df_core, use_container_width=True, height=360)
+        # Quick previews
+        with st.expander("Preview: ES – Ledger–LE–CostOrg (first 50 rows)"):
+            st.dataframe(df_cost.head(50))
 
-# ----------------- Sheet 2 (Ledger–LE–Cost Org; row-per-cost-org, include orphans) -----------------
-rows_cost = []
-for r in costorg_rows:
-    cname = r["CostOrgName"] if r["CostOrgName"] else r["CostOrgCode"]
-    le_name = ident_to_le_name.get(r["LE_Ident"], "").strip()
-    ledgers = sorted(code_to_ledger.get(r["CostOrgCode"], []))
-    if ledgers:
-        for L in ledgers:
-            rows_cost.append({"Ledger Name": L, "Legal Entity": le_name, "Business Unit": "", "Cost Organization": cname})
-    else:
-        rows_cost.append({"Ledger Name": "", "Legal Entity": le_name, "Business Unit": "", "Cost Organization": cname})
+        with st.expander("Preview: Diagram XML (first 60 lines)"):
+            snippet = "\n".join(drawio_xml.splitlines()[:60])
+            st.code(snippet, language="xml")
 
-df_cost = pd.DataFrame(rows_cost, columns=["Ledger Name","Legal Entity","Business Unit","Cost Organization"]).drop_duplicates().reset_index(drop=True)
-st.success(f"Sheet 2 (Cost Orgs): {len(df_cost)} rows")
-st.dataframe(df_cost, use_container_width=True, height=320)
-
-# ----------------- Excel export (openpyxl) -----------------
-excel_buf = io.BytesIO()
-with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-    df_core.to_excel(writer, index=False, sheet_name="Core_Ledger_LE_BU")
-    df_cost.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg")
-
-st.download_button(
-    "⬇️ Download Excel (EnterpriseStructure_v2.xlsx)",
-    data=excel_buf.getvalue(),
-    file_name="EnterpriseStructure_v2.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-# ================== DRAW.IO (Ledger top, LE below, BU left lane, Cost Org right lane; edges upward) ==================
-def make_drawio_xml(df_core: pd.DataFrame, df_cost: pd.DataFrame) -> str:
-    # --- layout constants ---
-    LEFT_PAD   = 240
-    RIGHT_PAD  = 200
-    X_STEP     = 220
-    PAD_GROUP  = 120
-    W, H       = 180, 48
-
-    Y_LEDGER   = 120
-    Y_LE       = 280
-    Y_BU       = 440
-    Y_COST     = 520  # lower than BU (different vertical)
-
-    # --- styles ---
-    S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
-    S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
-    S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
-    S_COST   = "rounded=1;whiteSpace=wrap;html=1;fillColor=#DDEBFF;strokeColor=#3B82F6;fontSize=12;"
-
-    # upward edges: top center (child) -> bottom center (parent)
-    EDGE_UP_GRAY = (
-        "endArrow=block;rounded=1;"
-        "edgeStyle=orthogonalEdgeStyle;orthogonal=1;jettySize=auto;"
-        "strokeColor=#666666;"
-        "exitX=0.5;exitY=0;"   # from top center of child
-        "entryX=0.5;entryY=1;" # to bottom center of parent
-    )
-    EDGE_UP_BLUE = EDGE_UP_GRAY.replace("#666666", "#3B82F6")
-
-    # --- normalize inputs ---
-    core = df_core[["Ledger Name","Legal Entity","Business Unit"]].copy().fillna("").astype(str).applymap(lambda x: x.strip())
-    cost = df_cost[["Ledger Name","Legal Entity","Cost Organization"]].copy().fillna("").astype(str).applymap(lambda x: x.strip())
-
-    # Build maps
-    ledgers = sorted(list(set([x for x in core["Ledger Name"].unique() if x]) | set([x for x in cost["Ledger Name"].unique() if x])))
-
-    led_to_les = {}
-    for _, r in core.iterrows():
-        L,E = r["Ledger Name"], r["Legal Entity"]
-        if L and E:
-            led_to_les.setdefault(L, set()).add(E)
-    for _, r in cost.iterrows():
-        L,E = r["Ledger Name"], r["Legal Entity"]
-        if L and E:
-            led_to_les.setdefault(L, set()).add(E)
-
-    le_to_bu = {}
-    for _, r in core.iterrows():
-        L,E,B = r["Ledger Name"], r["Legal Entity"], r["Business Unit"]
-        if L and E and B:
-            le_to_bu.setdefault((L,E), set()).add(B)
-
-    le_to_cost = {}
-    for _, r in cost.iterrows():
-        L,E,C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
-        if L and E and C:
-            le_to_cost.setdefault((L,E), set()).add(C)
-
-    # --- positioning ---
-    next_x = LEFT_PAD
-    led_x, le_x, bu_x, cost_x = {}, {}, {}, {}
-
-    for L in ledgers:
-        les = sorted(list(led_to_les.get(L, set())))
-        if not les:
-            # ensure ledger shows even if no LE
-            led_x[L] = next_x
-            next_x += X_STEP + PAD_GROUP
-            continue
-
-        # 1) allocate BU left lane slots
-        lane_left_positions = []
-        for E in les:
-            buses = sorted(list(le_to_bu.get((L,E), set())))
-            if buses:
-                for b in buses:
-                    if b not in bu_x:
-                        bu_x[b] = next_x
-                        next_x += X_STEP
-                lane_left_positions += [bu_x[b] for b in buses]
-            else:
-                # reserve left slot under this LE for symmetry
-                lane_left_positions.append(next_x)
-                next_x += X_STEP
-
-        # gap between lanes
-        next_x += 120
-
-        # 2) allocate Cost Org right lane slots (lower row, own vertical)
-        lane_right_positions = []
-        for E in les:
-            costs = sorted(list(le_to_cost.get((L,E), set())))
-            if costs:
-                for c in costs:
-                    if c not in cost_x:
-                        cost_x[c] = next_x
-                        next_x += X_STEP
-                lane_right_positions += [cost_x[c] for c in costs]
-            else:
-                lane_right_positions.append(next_x)
-                next_x += X_STEP
-
-        # center each LE over midpoint of its local left/right children
-        # (if only one side has children, center over that side)
-        # compute per-LE centers
-        # collect per-LE xs
-        tmp_centers = {}
-        idx_left = 0
-        idx_right = 0
-        for E in les:
-            buses = sorted(list(le_to_bu.get((L,E), set())))
-            costs = sorted(list(le_to_cost.get((L,E), set())))
-            xs = []
-            if buses:
-                xs += [bu_x[b] for b in buses]
-            else:
-                xs += [lane_left_positions[idx_left]]
-            idx_left += (len(buses) or 1)
-            if costs:
-                xs += [cost_x[c] for c in costs]
-            else:
-                xs += [lane_right_positions[idx_right]]
-            idx_right += (len(costs) or 1)
-            tmp_centers[E] = int(sum(xs)/len(xs))
-
-        # place LEs and Ledger
-        for E in les:
-            le_x[(L,E)] = tmp_centers[E]
-        led_x[L] = int(sum(le_x[(L,E)] for E in les)/len(les))
-
-        # gap before next ledger block
-        next_x += PAD_GROUP
-
-    # right pad space for any orphans
-    next_x += RIGHT_PAD
-
-    # --- XML skeleton ---
-    mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
-    diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
-    model   = ET.SubElement(diagram, "mxGraphModel", attrib={
-        "dx": "1284", "dy": "682", "grid": "1", "gridSize": "10",
-        "page": "1", "pageWidth": "2400", "pageHeight": "1400",
-        "background": "#ffffff"
-    })
-    root    = ET.SubElement(model, "root")
-    ET.SubElement(root, "mxCell", attrib={"id": "0"})
-    ET.SubElement(root, "mxCell", attrib={"id": "1", "parent": "0"})
-
-    def add_vertex(label, style, x, y, w=W, h=H):
-        vid = uuid.uuid4().hex[:8]
-        c = ET.SubElement(root, "mxCell", attrib={"id": vid, "value": label, "style": style, "vertex": "1", "parent": "1"})
-        ET.SubElement(c, "mxGeometry", attrib={"x": str(int(x)), "y": str(int(y)), "width": str(w), "height": str(h), "as": "geometry"})
-        return vid
-
-    def add_edge(src, tgt, style):
-        eid = uuid.uuid4().hex[:8]
-        c = ET.SubElement(root, "mxCell", attrib={
-            "id": eid, "value": "", "style": style, "edge": "1", "parent": "1",
-            "source": src, "target": tgt
-        })
-        ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
-
-    id_map = {}
-
-    # Ledger nodes
-    for L in ledgers:
-        id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
-
-    # LE nodes
-    for L in ledgers:
-        for E in sorted(list(led_to_les.get(L, set()))):
-            id_map[("E", L, E)] = add_vertex(E, S_LE, le_x[(L,E)], Y_LE)
-
-    # BU nodes (left lane)
-    for (L,E), buses in le_to_bu.items():
-        for b in sorted(list(buses)):
-            id_map[("B", L, E, b)] = add_vertex(f"{b} BU", S_BU, bu_x[b], Y_BU)
-
-    # Cost Org nodes (right lane; lower)
-    cost_nodes_drawn = set()
-    for (L,E), costs in le_to_cost.items():
-        for c in sorted(list(costs)):
-            if c not in cost_nodes_drawn:
-                id_map[("C", L, E, c)] = add_vertex(c, S_COST, cost_x[c], Y_COST)
-                cost_nodes_drawn.add(c)
-
-    # Edges upward with top/bottom anchoring: Cost→BU (blue), BU→LE (gray), LE→Ledger (gray)
-    for (L,E), costs in le_to_cost.items():
-        for c in sorted(list(costs)):
-            # connect Cost Org -> nearest BU under same LE if one exists, else directly to LE
-            buses = sorted(list(le_to_bu.get((L,E), set())))
-            src = id_map.get(("C", L, E, c))
-            if buses:
-                for b in buses:
-                    tgt = id_map.get(("B", L, E, b))
-                    if src and tgt:
-                        add_edge(src, tgt, EDGE_UP_BLUE)
-            else:
-                tgt = id_map.get(("E", L, E))
-                if src and tgt:
-                    add_edge(src, tgt, EDGE_UP_BLUE)
-
-    for (L,E), buses in le_to_bu.items():
-        for b in sorted(list(buses)):
-            src = id_map.get(("B", L, E, b))
-            tgt = id_map.get(("E", L, E))
-            if src and tgt:
-                add_edge(src, tgt, EDGE_UP_GRAY)
-
-    for L, les in led_to_les.items():
-        for E in les:
-            src = id_map.get(("E", L, E))
-            tgt = id_map.get(("L", L))
-            if src and tgt:
-                add_edge(src, tgt, EDGE_UP_GRAY)
-
-    # Legend
-    def add_legend(x=20, y=20):
-        def swatch(lbl, color, gy):
-            add_vertex("", f"rounded=1;fillColor={color};strokeColor=#666666;", x+12, y+gy, 18, 12)
-            add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=12;", x+36, y+gy-4, 280, 20)
-        add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 320, 160)
-        swatch("Ledger", "#FFE6E6", 36)
-        swatch("Legal Entity", "#FFE2C2", 62)
-        swatch("Business Unit (left lane)", "#FFF1B3", 88)
-        swatch("Cost Organization (right lane, lower)", "#DDEBFF", 114)
-
-    add_legend()
-    return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
-
-# Build & offer the diagram
-xml = make_drawio_xml(df_core, df_cost)
-st.download_button(
-    "⬇️ Download diagram (.drawio)",
-    data=xml.encode("utf-8"),
-    file_name="EnterpriseStructure.drawio",
-    mime="application/xml"
-)
-st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(xml)})")
-st.caption("Arrows go upward: Cost Org → BU → Legal Entity → Ledger. BU lane left; Cost Org lane right & lower. No backdrop boxes.")
+    except Exception as e:
+        st.exception(e)
