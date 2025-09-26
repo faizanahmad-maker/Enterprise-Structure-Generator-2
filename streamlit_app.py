@@ -195,60 +195,61 @@ else:
     )
     df1.insert(0, "Assignment", range(1, len(df1) + 1))
 
-    # ===================================================
-    # Tab 2: Ledger – Legal Entity – Cost Organization (identifier-driven)
-    # ===================================================
-    rows2 = []
-    seen_pairs2 = set()
+   # ===================================================
+# Tab 2: Ledger – Legal Entity – Cost Organization  (identifier-driven + BU-union)
+# ===================================================
+rows2 = []
+seen_pairs2 = set()   # (ledger, LE) we've already emitted via CO rows
 
-    for r in costorg_rows:
-        co = r["Name"]
-        ident = r["LegalEntityIdentifier"]
-        le = ident_to_le_name.get(ident, "")
-        leds = ident_to_ledgers.get(ident, set())
-        if leds:
-            for led in sorted(leds):
-                rows2.append({"Ledger Name": led, "Legal Entity": le, "Cost Organization": co})
-                seen_pairs2.add((led, le))
-        else:
-            rows2.append({"Ledger Name": "", "Legal Entity": le, "Cost Organization": co})
+# 0) Base pairs coming from Tab 1 (so both tabs align)
+base_pairs = {
+    (r["Ledger Name"], r["Legal Entity"])
+    for _, r in df1.iterrows()
+    if str(r["Ledger Name"]).strip() and str(r["Legal Entity"]).strip()
+}
 
-    for led, le in sorted(known_pairs):
-        if (led, le) not in seen_pairs2:
-            rows2.append({"Ledger Name": led, "Legal Entity": le, "Cost Organization": ""})
+# 1) From cost orgs → ident → ledgers (one row per ledger if identifier maps to multiple ledgers)
+for r in costorg_rows:
+    co = r["Name"]
+    ident = r["LegalEntityIdentifier"]
+    le = ident_to_le_name.get(ident, "")
+    leds = ident_to_ledgers.get(ident, set())
+    if leds:
+        for led in sorted(leds):
+            rows2.append({"Ledger Name": led, "Legal Entity": le, "Cost Organization": co})
+            seen_pairs2.add((led, le))
+    else:
+        # no mapping to any ledger found; emit with blank ledger so user sees the orphan
+        rows2.append({"Ledger Name": "", "Legal Entity": le, "Cost Organization": co})
 
-    seen_ledgers_any_co = {row["Ledger Name"] for row in rows2 if row["Ledger Name"]}
-    for led in sorted(ledger_names - seen_ledgers_any_co):
-        rows2.append({"Ledger Name": led, "Legal Entity": "", "Cost Organization": ""})
+# 2) Ensure *all* Ledger–LE pairs from Tab 1 appear here (even if no COs / no mapping)
+for led, le in sorted(base_pairs):
+    if (led, le) not in seen_pairs2:
+        rows2.append({"Ledger Name": led, "Legal Entity": le, "Cost Organization": ""})
+        seen_pairs2.add((led, le))
 
-    df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
-    df2["__LedgerEmpty"] = (df2["Ledger Name"] == "").astype(int)
-    df2 = (
-        df2.sort_values(
-            ["__LedgerEmpty", "Ledger Name", "Legal Entity", "Cost Organization"],
-            ascending=[True, True, True, True]
-        )
-        .drop(columns="__LedgerEmpty")
-        .reset_index(drop=True)
+# 3) Also add mapping-known pairs that didn't appear yet (paranoia/safety)
+for led, le in sorted(known_pairs):
+    if (led, le) not in seen_pairs2:
+        rows2.append({"Ledger Name": led, "Legal Entity": le, "Cost Organization": ""})
+        seen_pairs2.add((led, le))
+
+# 4) Completely orphan ledgers (exist in masters, but no CO rows and no base pair)
+seen_ledgers_any_co = {row["Ledger Name"] for row in rows2 if row["Ledger Name"]}
+for led in sorted(ledger_names - seen_ledgers_any_co):
+    rows2.append({"Ledger Name": led, "Legal Entity": "", "Cost Organization": ""})
+
+df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
+df2["__LedgerEmpty"] = (df2["Ledger Name"] == "").astype(int)
+df2 = (
+    df2.sort_values(
+        ["__LedgerEmpty", "Ledger Name", "Legal Entity", "Cost Organization"],
+        ascending=[True, True, True, True]
     )
-    df2.insert(0, "Assignment", range(1, len(df2) + 1))
-
-    # ------------ Excel Output ------------
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        df1.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
-        df2.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_Assignments")
-
-    st.success(f"Built {len(df1)} BU rows and {len(df2)} Cost Org rows.")
-    st.dataframe(df1.head(25), use_container_width=True, height=280)
-    st.dataframe(df2.head(25), use_container_width=True, height=280)
-
-    st.download_button(
-        "⬇️ Download Excel (EnterpriseStructure.xlsx)",
-        data=excel_buf.getvalue(),
-        file_name="EnterpriseStructure.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    .drop(columns="__LedgerEmpty")
+    .reset_index(drop=True)
+)
+df2.insert(0, "Assignment", range(1, len(df2) + 1))
 
     # ===================== DRAW.IO DIAGRAM BLOCK (with parking lots, safe guards) =====================
     if (
