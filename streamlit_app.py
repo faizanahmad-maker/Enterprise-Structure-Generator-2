@@ -260,8 +260,11 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # ===================== DRAW.IO DIAGRAM BLOCK (with parking lots) =====================
-if not df1.empty:
+  # ===================== DRAW.IO DIAGRAM BLOCK (with parking lots, safe guards) =====================
+if (
+    "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
+    "df2" in locals() and isinstance(df2, pd.DataFrame)  # df2 can be empty; still ok
+):
     import xml.etree.ElementTree as ET
     import zlib, base64, uuid
 
@@ -296,10 +299,10 @@ if not df1.empty:
             for c in df.columns:
                 df[c] = df[c].fillna("").map(str).str.strip()
 
-        # ledgers present in either tab
+        # ledgers present in either tab (includes orphan ledgers because df1 has blank LE rows)
         ledgers = sorted([x for x in set(df_bu["Ledger Name"]) | set(df_co["Ledger Name"]) if x])
 
-        # ledger -> set(LE), maps of children (assigned only)
+        # ledger -> set(LE) for assigned pairs only
         le_map = {}
         for _, r in pd.concat([df_bu, df_co]).iterrows():
             if r["Ledger Name"] and r["Legal Entity"]:
@@ -316,12 +319,10 @@ if not df1.empty:
                 co_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Cost Organization"])
 
         # ----- parking-lot sets (UNASSIGNED) -----
-        # LEs with no ledger in either tab
         unassigned_les = sorted(
             set(df_bu.loc[(df_bu["Ledger Name"] == "") & (df_bu["Legal Entity"] != ""), "Legal Entity"].unique())
             | set(df_co.loc[(df_co["Ledger Name"] == "") & (df_co["Legal Entity"] != ""), "Legal Entity"].unique())
         )
-        # BUs present but not attached to any (ledger, LE)
         all_bus = set(df_bu.loc[df_bu["Business Unit"] != "", "Business Unit"].unique())
         assigned_bus = set(
             df_bu.loc[
@@ -330,7 +331,6 @@ if not df1.empty:
             ].unique()
         )
         unassigned_bus = sorted(all_bus - assigned_bus)
-        # Ledgers with no LEs (these already render as single nodes because le_map[L] is empty)
 
         # --- x-coordinates ---
         next_x = LEFT_PAD
@@ -341,7 +341,7 @@ if not df1.empty:
             for le in les:
                 buses = sorted(bu_map.get((L, le), []))
                 cos   = sorted(co_map.get((L, le), []))
-                all_children = buses + cos if (buses or cos) else [le]
+                all_children = (buses + cos) if (buses or cos) else [le]
 
                 for child in all_children:
                     if child not in bu_x and child not in co_x:
@@ -366,7 +366,7 @@ if not df1.empty:
                 next_x += X_STEP
             next_x += PAD_GROUP
 
-        # --- allocate parking lots to the right ---
+        # allocate parking lots to the right
         next_x += RIGHT_PAD
         for e in unassigned_les:
             le_x[("UNASSIGNED", e)] = next_x
@@ -415,7 +415,7 @@ if not df1.empty:
                 for c in sorted(co_map.get((L, le), [])):
                     id_map[("C", L, le, c)] = add_vertex(c, S_CO, co_x[c], Y_CO)
 
-        # parking lot vertices (unassigned)
+        # parking-lot vertices
         for e in unassigned_les:
             id_map[("E_UN", e)] = add_vertex(e, S_LE, le_x[("UNASSIGNED", e)], Y_LE)
         for b in unassigned_bus:
@@ -424,14 +424,11 @@ if not df1.empty:
         # --- edges (assigned only) ---
         for L in ledgers:
             for le in sorted(le_map.get(L, [])):
-                # LE → Ledger
                 if ("E", L, le) in id_map and ("L", L) in id_map:
                     add_edge(id_map[("E", L, le)], id_map[("L", L)])
-                # BU → LE
                 for b in sorted(bu_map.get((L, le), [])):
                     if ("B", L, le, b) in id_map:
                         add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
-                # CO → LE
                 for c in sorted(co_map.get((L, le), [])):
                     if ("C", L, le, c) in id_map:
                         add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
