@@ -370,7 +370,7 @@ else:
             S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
             S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
             S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#E2F7E2;strokeColor=#3D8B3D;fontSize=12;"
-            S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#CFF5CF;strokeColor=#2F7D2F;fontSize=12;"
+            S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#66A266;strokeColor=#2F7D2F;fontSize=12;"
             S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
                         "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
             S_HDR    = "text;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;"
@@ -578,7 +578,7 @@ else:
                 swatch("Legal Entity", "#FFE2C2", 62)
                 swatch("Business Unit", "#FFF1B3", 88)
                 swatch("Cost Org", "#E2F7E2", 114)
-                swatch("Cost Book", "#CFF5CF", 140)
+                swatch("Cost Book", "#66A266", 140)
             add_legend()
 
             return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
