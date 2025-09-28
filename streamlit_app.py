@@ -407,7 +407,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ===================== DRAW.IO DIAGRAM (direct-IO trunk pushed right + cost books restored) =====================
+# ===================== DRAW.IO DIAGRAM (cost books + primary flag + direct-IO trunk) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -415,44 +415,42 @@ if (
     import xml.etree.ElementTree as ET
     import zlib, base64, uuid
     import pandas as pd
-    from types import MappingProxyType
 
-    # --- Try to find a Costing tab automatically (Tab 3). Prefer explicit df_cost; otherwise scan locals. ---
+    # Try to locate the Costing tab automatically (Tab 3)
     df_cost = locals().get("df_cost", None)
     if (df_cost is None) or not isinstance(df_cost, pd.DataFrame) or df_cost.empty:
-        for _name, _obj in list(locals().items()):
+        for _n, _obj in list(locals().items()):
             if isinstance(_obj, pd.DataFrame) and not _obj.empty:
                 cols = {c.strip().lower() for c in _obj.columns}
-                # Heuristic signature for the Costing Structure sheet
-                if ("cost organization" in cols or "cost org" in cols) and ("cost book" in cols):
+                if (("cost organization" in cols) or ("cost org" in cols)) and ("cost book" in cols):
                     df_cost = _obj.copy()
                     break
 
     def _make_drawio_xml(df_bu: pd.DataFrame, df_io: pd.DataFrame, df_costing: pd.DataFrame | None) -> str:
-        # ---------- Geometry / layout ----------
+        # ---------- Geometry ----------
         W, H = 180, 48
         Y_LEDGER, Y_LE, Y_BU, Y_CO, Y_CB, Y_IO = 150, 320, 480, 640, 800, 960
 
         def elbow(y_child, y_parent, bias=0.75):
             return int(y_parent + (y_child - y_parent) * bias)
 
-        ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)  # LE→Ledger bus height
-        ELBOW_BU_TO_LE  = elbow(Y_BU, Y_LE)      # BU/Direct-IO horizontal
-        ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)      # CO horizontal
-        ELBOW_IO_TO_CO  = elbow(Y_IO, Y_CO)      # CO-owned IO horizontal split
+        ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)  # LE → Ledger bus
+        ELBOW_BU_TO_LE  = elbow(Y_BU, Y_LE)      # BU elbow height
+        ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)      # CO elbow height
+        ELBOW_IO_TO_CO  = elbow(Y_IO, Y_CO)      # CO-owned IO split
+        ELBOW_CB_TO_CO  = elbow(Y_CB, Y_CO)      # Book → CO split  (FIX)
 
         # spacing
         MIN_GAP = 70
         def spread(base): return max(base, W + MIN_GAP)
-        BU_SPREAD_BASE, CO_SPREAD_BASE    = 210, 230
+        BU_SPREAD_BASE, CO_SPREAD_BASE = 210, 230
         IO_UNDER_CO_BASE, BOOK_SPREAD_BASE = 190, 170
         LEDGER_BLOCK_GAP, CLUSTER_GAP, LEFT_PAD = 120, 420, 260
         MIN_UMBRELLA_GAP = 140
 
-        # Direct-IO basin sits to the right of CO lane
+        # Direct-IO basin to the right of CO lane
         DIO_BASIN_GAP    = 200
-        # NEW: push the direct-IO trunk a bit further right than the midpoint of those IO boxes
-        TRUNK_RIGHT_BIAS = 90   # tweak to taste
+        TRUNK_RIGHT_BIAS = 90   # push the vertical trunk slightly further right
 
         # ---------- Styles ----------
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -482,9 +480,9 @@ if (
         LCOL = pick(df_io, ["Ledger Name","Ledger"])
         ECOL = pick(df_io, ["Legal Entity","LegalEntity"])
         COCOL= pick(df_io, ["Cost Organization","Cost Org","CostOrganization"])
-        IOCOL= pick(df_io, ["Inventory Org","Inventory Organization","InventoryOrg","Inventory Organization Name"])
+        IOCOL= pick(df_io, ["Inventory Org","Inventory Organization","InventoryOrg"])
         MFGCOL=pick(df_io, ["Manufacturing Plant","Mfg","ManufacturingPlant","IsManufacturingPlant"])
-        IO_BKC   = pick(df_io, ["Cost Book","CostBook","Cost Books"])             # optional in IO tab
+        IO_BKC   = pick(df_io, ["Cost Book","CostBook","Cost Books"])
         IO_BKPC  = pick(df_io, ["Primary Cost Book","PrimaryBook","Primary CostBook"])
         df_io = df_io[[x for x in [LCOL,ECOL,COCOL,IOCOL,MFGCOL,IO_BKC,IO_BKPC] if x is not None]].copy().fillna("").astype(str)
         df_io.rename(columns={LCOL:"Ledger Name", ECOL:"Legal Entity", COCOL:"Cost Organization",
@@ -492,7 +490,7 @@ if (
         if IO_BKC:  df_io.rename(columns={IO_BKC:"Cost Book"}, inplace=True)
         if IO_BKPC: df_io.rename(columns={IO_BKPC:"Primary Cost Book"}, inplace=True)
 
-        # Costing tab (Tab 3) — optional but preferred for books/primary flag
+        # Costing tab (Tab 3)
         if df_costing is not None and not df_costing.empty:
             cLCOL = pick(df_costing, ["Ledger Name","Ledger"])
             cECOL = pick(df_costing, ["Legal Entity","LegalEntity"])
@@ -515,7 +513,7 @@ if (
 
         tmp = pd.concat([df_bu[["Ledger Name","Legal Entity"]], df_io[["Ledger Name","Legal Entity"]]]).drop_duplicates()
         for _, r in tmp.iterrows():
-            L, E = r["Ledger Name"], r["Legal Entity"]
+            L,E = r["Ledger Name"], r["Legal Entity"]
             if L and E: le_map.setdefault(L, set()).add(E)
 
         for _, r in df_bu.iterrows():
@@ -540,7 +538,7 @@ if (
                     if all(x["Name"] != IO for x in dio_by_le[(L,E)]):
                         dio_by_le[(L,E)].append(rec)
 
-        # Books from IO tab (if present)
+        # Books from IO tab (if any)
         if "Cost Book" in df_io.columns and df_io["Cost Book"].astype(str).str.strip().any():
             for _, r in df_io.iterrows():
                 L,E,C = r.get("Ledger Name",""), r.get("Legal Entity",""), r.get("Cost Organization","")
@@ -555,7 +553,7 @@ if (
                             is_primary = raw in ("yes","y","true","1")
                             cb_primary[(L,E,C,bk)] = is_primary
 
-        # Books from Costing tab (preferred / overrides)
+        # Books from Costing tab (preferred)
         if df_costing is not None:
             for _, r in df_costing.iterrows():
                 L,E,C = r.get("Ledger Name",""), r.get("Legal Entity",""), r.get("Cost Organization","")
@@ -586,23 +584,26 @@ if (
             les = sorted(le_map.get(L, []))
             centers = []
             for E in les:
-                cx_le_val = next_x
-                le_x[(L,E)] = cx_le_val
-                centers.append(cx_le_val)
+                # LE
+                le_pos = next_x
+                le_x[(L,E)] = le_pos
+                centers.append(le_pos)
 
                 cos = sorted(co_map.get((L,E), []))
                 has_direct_io = bool(dio_by_le.get((L,E), []))
                 has_io_under_co = any(io_by_co.get((L,E,c)) for c in cos)
                 has_any_co_or_io = bool(cos) or has_io_under_co or has_direct_io
 
-                bu_center = cx_le_val if not has_any_co_or_io else (cx_le_val - 150)
+                # BU lane left if CO/IO exists, otherwise center straight down
+                bu_center = le_pos if not has_any_co_or_io else (le_pos - 150)
                 bu_list = sorted(bu_map.get((L,E), []))
                 for x,b in zip(centered_positions(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
                     bu_x[(L,E,b)] = x
 
-                for x,c in zip(centered_positions(cx_le_val, len(cos), CO_SPREAD_BASE), cos):
+                # COs
+                for x,c in zip(centered_positions(le_pos, len(cos), CO_SPREAD_BASE), cos):
                     co_x[(L,E,c)] = x
-                    # books left of CO
+                    # Books (stack left)
                     books = sorted(dict.fromkeys(cb_by_co.get((L,E,c), [])))
                     for i,bk in enumerate(books, start=1):
                         cb_x[(L,E,c,bk)] = x - i * BOOK_SPREAD_BASE
@@ -611,19 +612,19 @@ if (
                     for xio, rec in zip(centered_positions(x, len(ios), IO_UNDER_CO_BASE), ios):
                         io_x[(L,E,c,rec["Name"])] = (xio, rec["Mfg"])
 
-                # direct IOs
+                # direct IOs → put in right basin
                 dlist = sorted(dio_by_le.get((L,E), []), key=lambda d: d["Name"])
                 if dlist:
-                    xs_ref = [cx_le_val] + [co_x[(L,E,c)] for c in cos]
+                    xs_ref = [le_pos] + [co_x[(L,E,c)] for c in cos]
                     for c in cos:
                         xs_ref += [io_x[(L,E,c,r["Name"])][0] for r in io_by_co.get((L,E,c), [])]
-                    right_edge = max(xs_ref) if xs_ref else cx_le_val
+                    right_edge = max(xs_ref) if xs_ref else le_pos
                     basin_center = right_edge + DIO_BASIN_GAP + W/2
                     for xio, rec in zip(centered_positions(basin_center, len(dlist), IO_UNDER_CO_BASE), dlist):
                         dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
 
-                # umbrella guard
-                xs_span = [cx_le_val]
+                # umbrella guard to prevent bumps
+                xs_span = [le_pos]
                 xs_span += [bu_x[(L,E,b)] for b in bu_list]
                 xs_span += [co_x[(L,E,c)] for c in cos]
                 for c in cos:
@@ -631,8 +632,8 @@ if (
                     xs_span += [cb_x[(L,E,c,bk)] for bk in cb_by_co.get((L,E,c), [])]
                 xs_span += [v[0] for k,v in dio_x.items() if k[:2]==(L,E)]
 
-                min_x = (min(xs_span) - W/2) if xs_span else cx_le_val - W/2
-                max_x_ = (max(xs_span) + W/2) if xs_span else cx_le_val + W/2
+                min_x = (min(xs_span) - W/2) if xs_span else le_pos - W/2
+                max_x_ = (max(xs_span) + W/2) if xs_span else le_pos + W/2
 
                 if prev_umbrella_max_x is not None and min_x < prev_umbrella_max_x + MIN_UMBRELLA_GAP:
                     shift = (prev_umbrella_max_x + MIN_UMBRELLA_GAP) - min_x
@@ -657,7 +658,7 @@ if (
             led_x[L] = int(sum(centers)/len(centers)) if centers else next_x
             next_x += CLUSTER_GAP
 
-        # ensure direct-IO basin doesn't bump CO-owned IOs
+        # keep direct-IO basin from bumping CO-owned IOs
         for L in ledgers_all:
             for E in sorted(le_map.get(L, [])):
                 co_ios = []
@@ -705,7 +706,7 @@ if (
         # Ledgers
         for L in ledgers_all:
             id_map[("L",L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
-        # LEs
+        # LEs and edges up to ledger
         for (L,E), x in le_x.items():
             id_map[("E",L,E)] = add_vertex(E, S_LE, x, Y_LE)
             add_edge_with_elbow(id_map[("E",L,E)], id_map[("L",L)], cx(x), cx(led_x[L]), ELBOW_LE_TO_LED)
@@ -730,7 +731,7 @@ if (
             id_map[("IO",L,E,c,name)] = add_vertex(label, style, x, Y_IO)
             add_edge_with_elbow(id_map[("IO",L,E,c,name)], id_map[("C",L,E,c)], cx(x), cx(co_x[(L,E,c)]), ELBOW_IO_TO_CO)
 
-        # Direct-to-LE IOs: trunk at (midpoint + bias), align at BU elbow then IO split
+        # Direct-to-LE IOs: vertical trunk (right-biased), align with BU elbow then IO split
         dio_trunk_x = {}
         for (L,E), lst in dio_by_le.items():
             if not lst: continue
@@ -753,7 +754,7 @@ if (
             ]
             add_edge_points(id_map[key], id_map[("E",L,E)], points)
 
-        # legend (smaller panel; won’t clip first ledger)
+        # Compact legend (top-left)
         def add_legend(x=12, y=12):
             _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 164, 168)
             items = [
@@ -778,6 +779,7 @@ if (
                 add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=11;", x+30, y+yoff-5+i*18, 120, 16)
 
         add_legend()
+
         return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
 
     def _drawio_url_from_xml(xml: str) -> str:
