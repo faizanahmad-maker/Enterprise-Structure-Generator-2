@@ -345,8 +345,7 @@ else:
         file_name="EnterpriseStructure.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-  # ===================== DRAW.IO DIAGRAM BLOCK (Cost Books + Inventory Orgs, spaced) =====================
+# ===================== DRAW.IO DIAGRAM BLOCK (Cost Books + Inventory Orgs, spaced & de-overlapped) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -358,7 +357,7 @@ if (
         # --- layout & spacing ---
         W, H       = 180, 48
         X_STEP     = 230
-        IO_STEP    = max(110, X_STEP // 2)   # tighter horizontal spacing for IOs
+        IO_STEP    = max(140, X_STEP // 2)  # ensure minimum IO spacing so they never overlap
         PAD_GROUP  = 60
         LEFT_PAD   = 260
         RIGHT_PAD  = 200
@@ -368,7 +367,7 @@ if (
         Y_BU       = 470
         Y_CO       = 630
         Y_CB       = 790
-        Y_IO       = 950   # IOs one tier below Cost Books
+        Y_IO       = 950  # IOs sit one tier below Cost Books
 
         # --- styles ---
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -376,12 +375,20 @@ if (
         S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
         S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#E2F7E2;strokeColor=#3D8B3D;fontSize=12;"
         S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#7FBF7F;strokeColor=#2F7D2F;fontSize=12;"
-        # Inventory Orgs
+        # Inventory Orgs: light blue; plants get thicker border
         S_IO       = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#2F71A8;fontSize=12;"
         S_IO_PLANT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
 
-        S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
-                    "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
+        # Base edge style (child→parent, orthogonal)
+        S_EDGE     = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
+                      "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;")  # child exits from top-center
+
+        # Special entry anchors to avoid line overlap at the Cost Org:
+        # - Books attach to LEFT side of Cost Org
+        # - IOs   attach to RIGHT side of Cost Org
+        S_EDGE_CB  = S_EDGE + "entryX=0;entryY=0.5;"   # left-center of parent
+        S_EDGE_IO  = S_EDGE + "entryX=1;entryY=0.5;"   # right-center of parent
+
         S_HDR    = "text;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;"
 
         # --- normalize input ---
@@ -416,7 +423,7 @@ if (
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"]:
                 cb_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]), set()).add(r["Cost Book"])
 
-        # IOs keyed by (L, LE, CO, CB) — only when a Cost Book is present (so they sit under CB visually)
+        # IOs belong visually under a Cost Book (to sit lower), but edge back to Cost Org
         for _, r in df_co_books.iterrows():
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"] and r["Inventory Org"]:
                 io_map.setdefault(
@@ -442,12 +449,12 @@ if (
         )
         unassigned_bus = sorted(all_bus - assigned_bus)
 
-        # --- x-coordinates (extend your base with IO layer) ---
+        # --- x-coordinates (extend base with IO layer) ---
         next_x = LEFT_PAD
         led_x, le_x, bu_x, co_x, cb_x, io_x = {}, {}, {}, {}, {}, {}
 
         for L in ledgers_all:
-            if L in orphan_ledgers: 
+            if L in orphan_ledgers:
                 continue
             les = sorted(le_map.get(L, []))
             for le in les:
@@ -455,7 +462,7 @@ if (
                 cos   = sorted(co_map.get((L, le), []))
                 all_children = (buses + cos) if (buses or cos) else [le]
 
-                # allocate sibling columns for BUs and COs (your base behavior)
+                # allocate sibling columns for BUs and COs (base behavior)
                 for child in all_children:
                     if (child in buses) and (child not in bu_x):
                         bu_x[child] = next_x; next_x += X_STEP
@@ -471,22 +478,22 @@ if (
                 else:
                     le_x[(L, le)] = next_x; next_x += X_STEP
 
-                # allocate books under each CO (your base)
+                # allocate books under each CO (base)
                 for c in cos:
                     books = sorted(cb_map.get((L, le, c), []))
                     if books:
                         base_x = co_x[c]
-                        start_x = base_x - (len(books)-1) * (X_STEP//2)
+                        start_x = base_x - (len(books)-1) * (X_STEP//2)  # LEFT cluster under CO
                         for i, bk in enumerate(books):
                             cb_x[(L, le, c, bk)] = start_x + i*(X_STEP)
 
-                            # NEW: allocate IOs under this book, centered on cb_x
+                            # allocate IOs under this book, centered on that CB, using IO_STEP spacing
                             io_list = io_map.get((L, le, c, bk), [])
                             if io_list:
                                 io_start = cb_x[(L, le, c, bk)] - (len(io_list)-1) * (IO_STEP//2)
                                 for j, io in enumerate(io_list):
-                                    key = (L, le, c, bk, io["Name"])
-                                    io_x[key] = io_start + j * IO_STEP
+                                    io_key = (L, le, c, bk, io["Name"])
+                                    io_x[io_key] = io_start + j * IO_STEP  # RIGHT cluster overall comes from edge anchoring
 
             if les:
                 xs = [le_x[(L, le)] for le in les]
@@ -525,25 +532,17 @@ if (
                 "x": str(int(x)), "y": str(int(y)), "width": str(W), "height": str(H), "as": "geometry"})
             return vid
 
-        def add_edge(src, tgt):
+        def add_edge_generic(src, tgt, style):
             eid = uuid.uuid4().hex[:8]
             c = ET.SubElement(root, "mxCell", attrib={
-                "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
+                "id": eid, "value": "", "style": style, "edge": "1", "parent": "1",
                 "source": src, "target": tgt})
             ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
-
-        def add_text(text, x, y):
-            tid = uuid.uuid4().hex[:8]
-            t = ET.SubElement(root, "mxCell", attrib={
-                "id": tid, "value": text, "style": S_HDR, "vertex": "1", "parent": "1"})
-            ET.SubElement(t, "mxGeometry", attrib={
-                "x": str(int(x)), "y": str(int(y)), "width": "260", "height": "22", "as": "geometry"})
-            return tid
 
         # --- vertices ---
         id_map = {}
         for L in ledgers_all:
-            if L in orphan_ledgers: 
+            if L in orphan_ledgers:
                 continue
             id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
 
@@ -555,7 +554,7 @@ if (
                     id_map[("C", L, le, c)] = add_vertex(c, S_CO, co_x[c], Y_CO)
                     for bk in sorted(cb_map.get((L, le, c), [])):
                         id_map[("CB", L, le, c, bk)] = add_vertex(bk, S_CB, cb_x.get((L, le, c, bk), co_x[c]), Y_CB)
-                        # IOs below this Cost Book (spaced horizontally)
+                        # IOs under this CB
                         for io in io_map.get((L, le, c, bk), []):
                             io_label = f"🏭 {io['Name']}" if io["Mfg"].lower() == "yes" else io["Name"]
                             style = S_IO_PLANT if io["Mfg"].lower() == "yes" else S_IO
@@ -563,29 +562,33 @@ if (
                             x_pos = io_x.get(key, cb_x.get((L, le, c, bk), co_x[c]))
                             id_map[("IO",) + key] = add_vertex(io_label, style, x_pos, Y_IO)
 
-        # --- edges (child → parent, as in your base) ---
+        # --- edges (child → parent) ---
         for L in ledgers_all:
-            if L in orphan_ledgers: 
+            if L in orphan_ledgers:
                 continue
             for le in sorted(le_map.get(L, [])):
+                # E -> L
                 if ("E", L, le) in id_map and ("L", L) in id_map:
-                    add_edge(id_map[("E", L, le)], id_map[("L", L)])
+                    add_edge_generic(id_map[("E", L, le)], id_map[("L", L)], S_EDGE)
+                # B -> E
                 for b in sorted(bu_map.get((L, le), [])):
                     if ("B", L, le, b) in id_map:
-                        add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
+                        add_edge_generic(id_map[("B", L, le, b)], id_map[("E", L, le)], S_EDGE)
+                # C -> E
                 for c in sorted(co_map.get((L, le), [])):
                     if ("C", L, le, c) in id_map:
-                        add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
+                        add_edge_generic(id_map[("C", L, le, c)], id_map[("E", L, le)], S_EDGE)
+                        # CB -> C (left entry on CO)
                         for bk in sorted(cb_map.get((L, le, c), [])):
                             if ("CB", L, le, c, bk) in id_map:
-                                add_edge(id_map[("CB", L, le, c, bk)], id_map[("C", L, le, c)])
-                                # IOs link to Cost Org (not to Cost Book)
+                                add_edge_generic(id_map[("CB", L, le, c, bk)], id_map[("C", L, le, c)], S_EDGE_CB)
+                                # IO -> C (right entry on CO)
                                 for io in io_map.get((L, le, c, bk), []):
                                     k = ("IO", L, le, c, bk, io["Name"])
                                     if k in id_map:
-                                        add_edge(id_map[k], id_map[("C", L, le, c)])
+                                        add_edge_generic(id_map[k], id_map[("C", L, le, c)], S_EDGE_IO)
 
-        # --- legend (extended) ---
+        # --- legend ---
         def add_legend(x=20, y=20):
             def swatch(lbl, color, offset, stroke="#666666", bold=False):
                 style = f"rounded=1;fillColor={color};strokeColor={stroke};"
@@ -600,14 +603,14 @@ if (
                     "style": "text;align=left;verticalAlign=middle;fontSize=12;",
                     "vertex": "1", "parent": "1"})
                 ET.SubElement(txt, "mxGeometry", attrib={
-                    "x": str(x+36), "y": str(y+offset-4), "width": "190", "height": "20", "as": "geometry"})
+                    "x": str(x+36), "y": str(y+offset-4), "width": "210", "height": "20", "as": "geometry"})
 
             swatch("Ledger", "#FFE6E6", 36)
             swatch("Legal Entity", "#FFE2C2", 62)
             swatch("Business Unit", "#FFF1B3", 88)
             swatch("Cost Org", "#E2F7E2", 114)
-            swatch("Cost Book", "#7FBF7F", 140)
-            swatch("Inventory Org", "#D6EFFF", 166, stroke="#2F71A8")
+            swatch("Cost Book (left)", "#7FBF7F", 140)
+            swatch("Inventory Org (right)", "#D6EFFF", 166, stroke="#2F71A8")
             swatch("Manufacturing Plant (IO)", "#D6EFFF", 192, stroke="#1F4D7A", bold=True)
 
         add_legend()
@@ -628,5 +631,6 @@ if (
         use_container_width=True
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
+
 
 
