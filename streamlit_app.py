@@ -56,12 +56,13 @@ if not uploads:
     st.info("Upload your ZIPs to generate the Excel & diagram.")
 else:
     # ------------ Collectors ------------
-    ledger_names = set()
-    ledger_to_idents = defaultdict(set)  # ledger -> {LE identifiers}
-    ident_to_name = {}                   # identifier -> LE Name
+    ledger_names = set()                 # {Ledger}
+    ledger_to_idents = defaultdict(set)  # Ledger -> {LE identifiers}
+    ident_to_ledgers = defaultdict(set)  # LE identifier -> {Ledgers}
+    ident_to_name = {}                   # LE identifier -> LE Name
+    le_from_xle = []                     # [{Identifier, Name}]
 
     bu_rows = []                         # [{BU, LEName, Ledger}]
-    le_from_xle = []                     # from XLE_ENTITY_PROFILE
 
     costorg_rows = []                    # {Name, LEIdent, JoinKey}
     books_by_joinkey = {}                # joinkey -> [(Book, PrimaryFlag)]
@@ -79,7 +80,7 @@ else:
         # Ledgers
         df = read_csv_from_zip(z, "GL_PRIMARY_LEDGER.csv")
         if df is not None:
-            col = pick_col(df, ["ORA_GL_PRIMARY_LEDGER_CONFIG.Name"])
+            col = pick_col(df, ["ORA_GL_PRIMARY_LEDGER_CONFIG.Name", "Name"])
             if col:
                 ledger_names |= set(df[col].dropna().map(str).str.strip())
 
@@ -99,7 +100,7 @@ else:
         # Ledger ↔ LE identifier
         df = read_csv_from_zip(z, "ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv")
         if df is not None:
-            led_col   = pick_col(df, ["GL_LEDGER.Name"])
+            led_col   = pick_col(df, ["GL_LEDGER.Name", "LedgerName"])
             ident_col = pick_col(df, ["LegalEntityIdentifier"])
             if led_col and ident_col:
                 for _, r in df[[led_col, ident_col]].dropna(how="all").iterrows():
@@ -107,13 +108,14 @@ else:
                     ident = str(r[ident_col]).strip()
                     if led and ident:
                         ledger_to_idents[led].add(ident)
+                        ident_to_ledgers[ident].add(led)
 
         # Business Units
         df = read_csv_from_zip(z, "FUN_BUSINESS_UNIT.csv")
         if df is not None:
             bu_col  = pick_col(df, ["Name"])
             le_col  = pick_col(df, ["LegalEntityName"])
-            led_col = pick_col(df, ["PrimaryLedgerName"])
+            led_col = pick_col(df, ["PrimaryLedgerName", "LedgerName"])
             if bu_col and le_col and led_col:
                 for _, r in df[[bu_col, le_col, led_col]].dropna(how="all").iterrows():
                     bu_rows.append({
@@ -181,47 +183,71 @@ else:
                     invorg_rel[str(r[inv_col]).strip()] = str(r[co_col]).strip()
 
     # ===================================================
-    # Tab 1: Core Enterprise Structure
+    # Tab 1: Ledger → Legal Entity → Business Unit
     # ===================================================
+
+    # Build (Ledger, LE Name) -> Identifier (unique per-ledger); if ambiguous, leave unset
+    ledger_le_name_to_ident = {}
+    for led, ident_set in ledger_to_idents.items():
+        name_to_ids = defaultdict(set)
+        for ident in ident_set:
+            nm = ident_to_name.get(ident, "")
+            if nm:
+                name_to_ids[nm].add(ident)
+        for nm, ids in name_to_ids.items():
+            if len(ids) == 1:
+                ledger_le_name_to_ident[(led, nm)] = next(iter(ids))
+            else:
+                # same LE name appears with multiple identifiers under the SAME ledger -> ambiguous, keep blank
+                ledger_le_name_to_ident[(led, nm)] = ""
+
     rows1, seen = [], set()
 
-    # 1. BU-driven rows
+    # 1) BU-driven rows (primary source of truth for BU membership)
     for r in bu_rows:
         bu = r["BU"]
         le_name = r["LEName"]
         led = r["Ledger"]
 
-        ident_candidates = [i for i, n in ident_to_name.items() if n == le_name]
-        ident = ident_candidates[0] if len(ident_candidates) == 1 else ""
+        # Resolve identifier using per-ledger mapping; if not resolvable, leave blank
+        ident = ledger_le_name_to_ident.get((led, le_name), "")
+        key = (led, ident or le_name, bu)  # use le_name as tiebreaker key if ident blank
+        if key in seen:
+            continue
+        rows1.append({
+            "Ledger Name": led,
+            "Legal Entity Identifier": ident,
+            "Legal Entity": le_name,
+            "Business Unit": bu
+        })
+        seen.add(key)
 
-        key = (led, ident, le_name, bu)
-        if key not in seen:
-            rows1.append({
-                "Ledger Name": led,
-                "Legal Entity Identifier": ident,
-                "Legal Entity": le_name,
-                "Business Unit": bu
-            })
-            seen.add(key)
-
-    # 2. Ledger → LE (no BU)
+    # 2) Ledger→LE rows where no BU exists (fill the hole once per LE)
     for led, idents in ledger_to_idents.items():
-        for ident in idents:
+        for ident in sorted(idents):
             le_name = ident_to_name.get(ident, "")
-            key = (led, ident, le_name, "")
-            if key not in seen:
-                rows1.append({
-                    "Ledger Name": led,
-                    "Legal Entity Identifier": ident,
-                    "Legal Entity": le_name,
-                    "Business Unit": ""
-                })
-                seen.add(key)
+            # Does any BU row exist for (led, ident)?
+            has_bu = any(
+                (row["Ledger Name"] == led) and
+                ((row["Legal Entity Identifier"] == ident) or (not row["Legal Entity Identifier"] and row["Legal Entity"] == le_name)) and
+                row["Business Unit"]
+                for row in rows1
+            )
+            if not has_bu:
+                key = (led, ident or le_name, "")
+                if key not in seen:
+                    rows1.append({
+                        "Ledger Name": led,
+                        "Legal Entity Identifier": ident,
+                        "Legal Entity": le_name,
+                        "Business Unit": ""
+                    })
+                    seen.add(key)
 
-    # 3. Orphan Ledgers
-    for led in ledger_names:
+    # 3) Orphan Ledgers (no LE assigned at all)
+    for led in sorted(ledger_names):
         if not ledger_to_idents.get(led):
-            key = (led, "", "", "")
+            key = (led, "", "")
             if key not in seen:
                 rows1.append({
                     "Ledger Name": led,
@@ -231,24 +257,35 @@ else:
                 })
                 seen.add(key)
 
-    # 4. Hanging LEs
+    # 4) Hanging LEs (exist in XLE, assigned to no ledger anywhere)
+    assigned_idents = set().union(*ledger_to_idents.values()) if ledger_to_idents else set()
     for le in le_from_xle:
         ident, name = le["Identifier"], le["Name"]
-        exists = any(r["Legal Entity Identifier"] == ident for r in rows1)
-        if not exists:
-            rows1.append({
-                "Ledger Name": "",
-                "Legal Entity Identifier": ident,
-                "Legal Entity": name,
-                "Business Unit": ""
-            })
+        if ident not in assigned_idents:
+            key = ("", ident or name, "")
+            if key not in seen:
+                rows1.append({
+                    "Ledger Name": "",
+                    "Legal Entity Identifier": ident,
+                    "Legal Entity": name,
+                    "Business Unit": ""
+                })
+                seen.add(key)
 
-    df1 = pd.DataFrame(rows1).drop_duplicates().reset_index(drop=True)
+    # Sort: Ledger asc, then LE name asc, BU asc; push hangers (blank ledger) to bottom
+    def _sort_key(r):
+        led = r["Ledger Name"] or "~ZZZ"  # blanks sort last
+        le  = r["Legal Entity"] or "~ZZZ"
+        bu  = r["Business Unit"] or "~ZZZ"
+        return (led, le, bu)
+
+    df1 = pd.DataFrame(rows1).drop_duplicates().sort_values(key=lambda c: None, by=[]).reset_index(drop=True)
+    df1 = df1.sort_values(by=["Ledger Name", "Legal Entity", "Business Unit"], key=lambda col: col.map(lambda x: x if x else "~ZZZ")).reset_index(drop=True)
     df1.insert(0, "Assignment", range(1, len(df1) + 1))
     df1 = _blankify(df1)
 
     # ===================================================
-    # Tab 2: Inventory Org Structure
+    # Tab 2: Inventory Org Structure (fix: use ident_to_ledgers)
     # ===================================================
     rows2 = []
     co_name_by_joinkey = {r["JoinKey"]: r["Name"] for r in costorg_rows if r.get("JoinKey")}
@@ -258,12 +295,13 @@ else:
         name = inv.get("Name", "")
         leid = inv.get("LEIdent", "")
         le_name  = ident_to_name.get(leid, "") if leid else ""
-        leds     = ledger_to_idents.get(leid, set()) if leid else set()
+        leds     = ident_to_ledgers.get(leid, set()) if leid else set()
 
         co_key  = invorg_rel.get(code, "")
         co_name = co_name_by_joinkey.get(co_key, "") if co_key else ""
 
         base_row = {
+            "Ledger Name": "",
             "Legal Entity Identifier": leid,
             "Legal Entity": le_name,
             "Cost Organization": co_name,
@@ -275,32 +313,31 @@ else:
 
         if leds:
             for led in sorted(leds):
-                rrow = {"Ledger Name": led}
-                rrow.update(base_row)
+                rrow = dict(base_row)
+                rrow["Ledger Name"] = led
                 rows2.append(rrow)
         else:
-            rrow = {"Ledger Name": ""}
-            rrow.update(base_row)
-            rows2.append(rrow)
+            rows2.append(base_row)
 
     df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
     df2.insert(0, "Assignment", range(1, len(df2) + 1))
     df2 = _blankify(df2)
 
     # ===================================================
-    # Tab 3: Costing Structure
+    # Tab 3: Costing Structure (fix: use ident_to_ledgers)
     # ===================================================
     rows3 = []
     for co in costorg_rows:
-        co_name = co.get("Name", "")
+        co_name  = co.get("Name", "")
         le_ident = co.get("LegalEntityIdentifier", "")
-        joink   = co.get("JoinKey", "")
-        le_name = ident_to_name.get(le_ident, "") if le_ident else ""
-        books = books_by_joinkey.get(joink, [])
-        leds  = ledger_to_idents.get(le_ident, set()) if le_ident else set()
+        joink    = co.get("JoinKey", "")
+        le_name  = ident_to_name.get(le_ident, "") if le_ident else ""
+        books    = books_by_joinkey.get(joink, [])
+        leds     = ident_to_ledgers.get(le_ident, set()) if le_ident else set()
 
         if not books:
             base = {
+                "Ledger Name": "",
                 "Legal Entity Identifier": le_ident,
                 "Legal Entity": le_name,
                 "Cost Organization": co_name,
@@ -309,32 +346,28 @@ else:
             }
             if leds:
                 for led in sorted(leds):
-                    r = {"Ledger Name": led}
-                    r.update(base)
+                    r = dict(base)
+                    r["Ledger Name"] = led
                     rows3.append(r)
             else:
-                r = {"Ledger Name": ""}
-                r.update(base)
-                rows3.append(r)
-            continue
-
-        for (bk, is_primary) in sorted(books, key=lambda x: (x[0], not x[1])):
-            base = {
-                "Legal Entity Identifier": le_ident,
-                "Legal Entity": le_name,
-                "Cost Organization": co_name,
-                "Cost Book": bk,
-                "Primary Cost Book": "Yes" if is_primary else "No"
-            }
-            if leds:
-                for led in sorted(leds):
-                    r = {"Ledger Name": led}
-                    r.update(base)
-                    rows3.append(r)
-            else:
-                r = {"Ledger Name": ""}
-                r.update(base)
-                rows3.append(r)
+                rows3.append(base)
+        else:
+            for (bk, is_primary) in sorted(books, key=lambda x: (x[0], not x[1])):
+                base = {
+                    "Ledger Name": "",
+                    "Legal Entity Identifier": le_ident,
+                    "Legal Entity": le_name,
+                    "Cost Organization": co_name,
+                    "Cost Book": bk,
+                    "Primary Cost Book": "Yes" if is_primary else "No"
+                }
+                if leds:
+                    for led in sorted(leds):
+                        r = dict(base)
+                        r["Ledger Name"] = led
+                        rows3.append(r)
+                else:
+                    rows3.append(base)
 
     df3 = pd.DataFrame(rows3).drop_duplicates().reset_index(drop=True)
     df3.insert(0, "Assignment", range(1, len(df3) + 1))
@@ -358,7 +391,6 @@ else:
         file_name="EnterpriseStructure.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
 
 
 # ===================== DRAW.IO DIAGRAM (CO straight down + GLOBAL MIN SPACING + guided trunk) =====================
