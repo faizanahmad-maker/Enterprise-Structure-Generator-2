@@ -394,6 +394,7 @@ else:
 
 
 # ===================== DRAW.IO DIAGRAM (edges behind + dynamic IO Y + optional BU stack) =====================
+# ===================== DRAW.IO DIAGRAM (edges behind + dynamic IO Y + BU stack with normalized keys) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame) and
@@ -401,7 +402,6 @@ if (
 ):
     import xml.etree.ElementTree as ET
     import zlib, base64, uuid
-    from collections import defaultdict
 
     def _make_drawio_xml(df_bu: pd.DataFrame, df_io: pd.DataFrame, df_costing: pd.DataFrame) -> str:
         # ---------- Geometry ----------
@@ -413,14 +413,13 @@ if (
             return int(y_parent + (y_child - y_parent) * bias)
 
         ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)
-        # BU elbow now computed per-BU (because BU may be vertically stacked)
         ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)
         ELBOW_CB_TO_CO  = elbow(Y_CB, Y_CO)
 
         # spacing
         MIN_GAP = 70
         def spread(base): return max(base, W + MIN_GAP)
-        BU_SPREAD_BASE, CO_SPREAD_BASE = 210, 230
+        BU_SPREAD_BASE = 210
         IO_UNDER_CO_BASE = 220
         LEDGER_BLOCK_GAP, CLUSTER_GAP, LEFT_PAD = 120, 420, 260
         MIN_UMBRELLA_GAP = 140
@@ -429,7 +428,6 @@ if (
         # lanes / offsets
         BU_LANE_OFFSET  = 180           # BU lane x-shift (when not stacked)
         DIO_LANE_OFFSET = 420           # direct IOs lane (right)
-        CO_LANE_OFFSET  = 0             # CO vertical under LE
 
         # books & BU stack visuals
         BOOK_X_OFFSET       = 220
@@ -475,8 +473,14 @@ if (
                     xs_sorted[i] = xs_sorted[i-1] + min_spacing
             return xs_sorted
 
+        def _strip_cols(df, cols):
+            for c in cols:
+                if c in df.columns:
+                    df[c] = df[c].astype(str).map(lambda x: x.strip())
+
         # ---------- Normalize inputs ----------
         df_bu = df_bu[["Ledger Name","Legal Entity","Business Unit"]].copy().fillna("").astype(str)
+        _strip_cols(df_bu, ["Ledger Name","Legal Entity","Business Unit"])
 
         # Tab 2
         LCOL = pick(df_io, ["Ledger Name","Ledger"])
@@ -487,6 +491,7 @@ if (
         df_io = df_io[[x for x in [LCOL,ECOL,COCOL,IOCOL,MFGCOL] if x is not None]].copy().fillna("").astype(str)
         df_io.rename(columns={LCOL:"Ledger Name", ECOL:"Legal Entity", COCOL:"Cost Organization",
                               IOCOL:"Inventory Org", MFGCOL:"Manufacturing Plant"}, inplace=True)
+        _strip_cols(df_io, ["Ledger Name","Legal Entity","Cost Organization","Inventory Org","Manufacturing Plant"])
 
         # Tab 3
         cLCOL = pick(df_costing, ["Ledger Name","Ledger"])
@@ -498,10 +503,12 @@ if (
         df_costing.rename(columns={cLCOL:"Ledger Name", cECOL:"Legal Entity", cCO:"Cost Organization",
                                    cBKC:"Cost Book"}, inplace=True)
         if cBKPC: df_costing.rename(columns={cBKPC:"Primary Cost Book"}, inplace=True)
+        _strip_cols(df_costing, ["Ledger Name","Legal Entity","Cost Organization","Cost Book","Primary Cost Book"])
 
         ledgers_all = sorted({*df_bu["Ledger Name"].unique(), *df_io["Ledger Name"].unique()} - {""})
 
         # ---------- Build maps ----------
+        from collections import defaultdict
         le_map = defaultdict(set)
         bu_map = defaultdict(list)       # (L,E) -> [BU]
         co_map = defaultdict(list)       # (L,E) -> [CO]
@@ -584,10 +591,6 @@ if (
                 # Decide BU layout:
                 use_bu_stack = (has_co and len(bu_list) > 1)
 
-                bu_center  = le_pos if (has_bu and not (has_co or has_dio)) else (le_pos - BU_LANE_OFFSET if has_bu and not use_bu_stack else le_pos)
-                co_center  = le_pos  # CO straight down
-                dio_center = le_pos + DIO_LANE_OFFSET if has_dio else None
-
                 # BUs
                 if has_bu:
                     if use_bu_stack:
@@ -597,6 +600,7 @@ if (
                             bu_pos[(L,E,b)] = (x_bu, Y_BU + i*BU_STACK_VERTICAL_GAP)
                     else:
                         # normal horizontal lane (existing behavior)
+                        bu_center  = le_pos if (has_bu and not (has_co or has_dio)) else (le_pos - BU_LANE_OFFSET if has_bu else le_pos)
                         for x,b in zip(centers(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
                             bu_pos[(L,E,b)] = (x, Y_BU)
 
@@ -606,7 +610,7 @@ if (
                     for idx, C in enumerate(sorted(cos)):
                         half = co_cluster_halfwidth(L,E,C)
                         if idx == 0:
-                            xC = co_center
+                            xC = le_pos
                         else:
                             prev = placed[-1]
                             need = prev["half"] + half + MIN_GAP
@@ -628,7 +632,7 @@ if (
                 # Direct IOs
                 if has_dio:
                     dlist = sorted(dio_by_le[(L,E)], key=lambda d: d["Name"])
-                    xs = centers(dio_center, len(dlist), IO_UNDER_CO_BASE)
+                    xs = centers(le_pos + DIO_LANE_OFFSET, len(dlist), IO_UNDER_CO_BASE)
                     xs = enforce_spacing_sorted(xs, MIN_GAP)
                     for xio, rec in zip(xs, dlist):
                         dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
@@ -679,7 +683,7 @@ if (
 
         for L in ledgers_all:
             for E in sorted(le_map[L]):
-                # BU layer (adjust x only; y stays as placed for stack/non-stack)
+                # BU layer
                 bu_keys = [(k, bu_pos[k][0]) for k in bu_pos if k[0]==L and k[1]==E]
                 layer_global_spacing(lambda k, nx: bu_pos.__setitem__(k, (nx, bu_pos[k][1])), bu_keys)
 
@@ -710,7 +714,7 @@ if (
         model   = ET.SubElement(diagram, "mxGraphModel", attrib={
             "dx":"1284","dy":"682","grid":"1","gridSize":"10",
             "page":"1","pageWidth":"1920","pageHeight":"1080",
-            "background":"#ffffff"
+            "background":"#111827"  # keep your dark background; change if needed
         })
         root    = ET.SubElement(model, "root")
         ET.SubElement(root, "mxCell", attrib={"id":"0"})
@@ -785,7 +789,7 @@ if (
             add_edge_points(
                 v, id_map[("E",L,E)],
                 [(trunk_x, ELBOW_IO_TO_CO),
-                 (trunk_x, elbow(Y_BU, Y_LE)),   # pass through BU elbow height
+                 (trunk_x, elbow(Y_BU, Y_LE)),
                  (le_center_x, elbow(Y_BU, Y_LE))]
             )
 
