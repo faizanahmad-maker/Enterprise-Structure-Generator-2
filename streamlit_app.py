@@ -3,22 +3,19 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Enterprise Structure Generator", page_icon="📊", layout="wide")
-st.title("Enterprise Structure Generator — Excel + draw.io (identifier-safe, no lost hangers)")
+st.title("Enterprise Structure Generator — 3 Tabs + Primary Cost Book (Excel + draw.io)")
 
 st.markdown("""
-Upload up to **9 Oracle export ZIPs** (any order):
-- `Manage General Ledger` → **GL_PRIMARY_LEDGER.csv**
-- `Manage Legal Entities` → **XLE_ENTITY_PROFILE.csv**
-- `Assign Legal Entities` → **ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv**
-- *(optional backup)* Journal config detail → **ORA_GL_JOURNAL_CONFIG_DETAIL.csv**
-- `Manage Business Units` → **FUN_BUSINESS_UNIT.csv**
-- `Manage Cost Organizations` → **CST_COST_ORGANIZATION.csv**
-- `Manage Cost Organization Relationships` → **CST_COST_ORG_BOOK.csv**
-- `Manage Inventory Organizations` → **INV_ORGANIZATION_PARAMETER.csv**
-- `Cost Org ↔ Inventory Org relationships` → **ORA_CST_COST_ORG_INV.csv**
+Upload your Oracle export ZIPs (any order). The app will auto-detect the files:
+- **Manage Primary Ledgers** → GL_PRIMARY_LEDGER.csv, ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv, (backup) ORA_GL_JOURNAL_CONFIG_DETAIL.csv
+- **Manage Legal Entity** → XLE_ENTITY_PROFILE.csv
+- **Manage Business Unit** → FUN_BUSINESS_UNIT.csv
+- **Manage Cost Organizations** → CST_COST_ORGANIZATION.csv
+- **Cost Organization Relationships** → CST_COST_ORG_BOOK.csv, ORA_CST_COST_ORG_INV.csv
+- **Manage Inventory Organizations** → INV_ORGANIZATION_PARAMETER.csv
 """)
 
-uploads = st.file_uploader("Drop your ZIPs here", type="zip", accept_multiple_files=True)
+uploads = st.file_uploader("Drop ZIPs here", type="zip", accept_multiple_files=True)
 
 # ---------- helpers ----------
 def read_csv_from_zip(zf, name):
@@ -28,6 +25,8 @@ def read_csv_from_zip(zf, name):
         return pd.read_csv(fh, dtype=str)
 
 def pick_col(df, candidates):
+    """Return the first matching column from `candidates` (exact > case-insensitive > substring)."""
+    if df is None: return None
     cols = list(df.columns)
     for c in candidates:
         if c in cols:
@@ -55,24 +54,27 @@ def _blankify(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 if not uploads:
-    st.info("Upload your ZIPs to generate the Excel & diagram.")
+    st.info("Upload the ZIPs to generate the Excel & diagram.")
 else:
     # ------------ Collectors ------------
     ledger_names = set()
     legal_entity_names = set()
     ledger_to_idents = {}            # ledger -> {LE identifier}
-    ident_to_le_name = {}            # identifier -> preferred name (ObjectName first, XLE fallback)
-    bu_rows = []                     # BU rows for Tab 1
+    ident_to_le_name = {}            # LE identifier -> LE name
+    bu_rows = []                     # BU rows for Tab 1 only
 
-    # Cost/IO data
+    # Cost Orgs (MASTER)
     costorg_rows = []                # [{Name, LegalEntityIdentifier, JoinKey}]
-    books_by_joinkey = {}            # JoinKey -> {CostBookCode}
-    invorg_rows = []                 # [{Code, Name, LEIdent, BUName, PCBU, Mfg}]
-    invorg_rel = {}                  # InvOrgCode -> CostOrgJoinKey
+    co_code_to_name = {}             # CostOrg join code -> Name
+    co_name_to_joinkeys = {}         # Name -> {JoinKey}
 
-    # Diagnostics
-    unresolved_ident_pairs = []      # [(Ledger, Identifier)]
-    name_collisions = []             # [(Ledger, DisplayName, [idents...])]
+    # Cost Books: for each CostOrg joinkey -> {CostBookCode: is_primary}
+    books_by_joinkey = {}
+
+    # Inventory Orgs (MASTER)
+    invorg_rows = []                 # [{Code, Name, LEIdent, BUName, PCBU, Mfg}]
+    # IO↔CostOrg relationships: InvOrgCode -> CostOrgJoinKey
+    invorg_rel = {}
 
     # ------------ Scan uploads ------------
     for up in uploads:
@@ -85,34 +87,33 @@ else:
         # Ledgers
         df = read_csv_from_zip(z, "GL_PRIMARY_LEDGER.csv")
         if df is not None:
-            col = pick_col(df, ["ORA_GL_PRIMARY_LEDGER_CONFIG.Name"])
+            col = pick_col(df, ["ORA_GL_PRIMARY_LEDGER_CONFIG.Name", "Name"])
             if col:
                 ledger_names |= set(df[col].dropna().map(str).str.strip())
             else:
-                st.warning("`GL_PRIMARY_LEDGER.csv` missing `ORA_GL_PRIMARY_LEDGER_CONFIG.Name`.")
+                st.warning("`GL_PRIMARY_LEDGER.csv` missing ledger name column.")
 
-        # Legal Entities (XLE master — fallback names & unassigned LEs)
+        # Legal Entities
         df = read_csv_from_zip(z, "XLE_ENTITY_PROFILE.csv")
         if df is not None:
-            name_col  = pick_col(df, ["Name", "LegalEntityName", "EntityName"])
-            ident_col = pick_col(df, ["LegalEntityIdentifier", "LEIdentifier"])
-            if name_col:
-                legal_entity_names |= set(df[name_col].dropna().map(str).str.strip())
+            name_col  = pick_col(df, ["Name"])
+            ident_col = pick_col(df, ["LegalEntityIdentifier"])
             if name_col and ident_col:
                 for _, r in df[[name_col, ident_col]].dropna(how="all").iterrows():
-                    nm  = str(r[name_col]).strip()
-                    ident = str(r[ident_col]).strip()
-                    # Only set if we don't already have ObjectName for this ident
-                    if ident and nm and ident not in ident_to_le_name:
-                        ident_to_le_name[ident] = nm
+                    le_name = str(r[name_col]).strip()
+                    le_ident = str(r[ident_col]).strip()
+                    if le_name:
+                        legal_entity_names.add(le_name)
+                    if le_ident and le_name:
+                        ident_to_le_name[le_ident] = le_name
             else:
                 st.warning(f"`XLE_ENTITY_PROFILE.csv` missing needed columns. Found: {list(df.columns)}")
 
         # Ledger ↔ LE identifier
         df = read_csv_from_zip(z, "ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv")
         if df is not None:
-            led_col   = pick_col(df, ["GL_LEDGER.Name", "LedgerName"])
-            ident_col = pick_col(df, ["LegalEntityIdentifier", "LEIdentifier"])
+            led_col   = pick_col(df, ["GL_LEDGER.Name"])
+            ident_col = pick_col(df, ["LegalEntityIdentifier"])
             if led_col and ident_col:
                 for _, r in df[[led_col, ident_col]].dropna(how="all").iterrows():
                     led = str(r[led_col]).strip()
@@ -122,19 +123,17 @@ else:
             else:
                 st.warning(f"`ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv` missing needed columns. Found: {list(df.columns)}")
 
-        # Prefer ObjectName for identifier → name
+        # Backup map for identifier -> LE name
         df = read_csv_from_zip(z, "ORA_GL_JOURNAL_CONFIG_DETAIL.csv")
         if df is not None:
-            ident_col = pick_col(df, ["LegalEntityIdentifier", "LEIdentifier"])
-            obj_col   = pick_col(df, ["ObjectName", "Name"])
+            ident_col = pick_col(df, ["LegalEntityIdentifier"])
+            obj_col   = pick_col(df, ["ObjectName"])
             if ident_col and obj_col:
                 for _, r in df[[ident_col, obj_col]].dropna(how="all").iterrows():
                     ident = str(r[ident_col]).strip()
                     obj   = str(r[obj_col]).strip()
-                    if ident and obj:
-                        ident_to_le_name[ident] = obj  # ObjectName takes precedence
-            else:
-                st.warning(f"`ORA_GL_JOURNAL_CONFIG_DETAIL.csv` missing needed columns. Found: {list(df.columns)}")
+                    if ident and obj and ident not in ident_to_le_name:
+                        ident_to_le_name[ident] = obj
 
         # Business Units (for Tab 1)
         df = read_csv_from_zip(z, "FUN_BUSINESS_UNIT.csv")
@@ -156,30 +155,38 @@ else:
         df = read_csv_from_zip(z, "CST_COST_ORGANIZATION.csv")
         if df is not None:
             name_col   = pick_col(df, ["Name"])
-            ident_col  = pick_col(df, ["LegalEntityIdentifier", "LEIdentifier"])
-            join_col   = pick_col(df, ["OrgInformation2"])  # join to BOOKS + IO relationships
+            ident_col  = pick_col(df, ["LegalEntityIdentifier"])
+            join_col   = pick_col(df, ["OrgInformation2", "OrganizationCode"])
             if name_col and ident_col and join_col:
                 for _, r in df[[name_col, ident_col, join_col]].dropna(how="all").iterrows():
                     name  = str(r[name_col]).strip()
                     ident = str(r[ident_col]).strip()
                     joink = str(r[join_col]).strip()
                     costorg_rows.append({"Name": name, "LegalEntityIdentifier": ident, "JoinKey": joink})
+                    if joink and name:
+                        co_code_to_name[joink] = name
+                    if name and joink:
+                        co_name_to_joinkeys.setdefault(name, set()).add(joink)
             else:
                 st.warning(f"`CST_COST_ORGANIZATION.csv` missing needed columns (Name, LegalEntityIdentifier, OrgInformation2). Found: {list(df.columns)}")
 
-        # Cost Books — JoinKey(CostOrgCode) -> {CostBookCode}
+        # Cost Books — JoinKey(CostOrgCode) -> {book: is_primary}
         df = read_csv_from_zip(z, "CST_COST_ORG_BOOK.csv")
         if df is not None:
             key_col  = pick_col(df, ["ORA_CST_ACCT_COST_ORG.CostOrgCode", "CostOrgCode"])
             book_col = pick_col(df, ["CostBookCode"])
-            if key_col and book_col:
-                for _, r in df[[key_col, book_col]].dropna(how="all").iterrows():
+            prim_col = pick_col(df, ["PrimaryBookFlag"])
+            if key_col and book_col and prim_col:
+                for _, r in df[[key_col, book_col, prim_col]].dropna(how="all").iterrows():
                     joink = str(r[key_col]).strip()
                     book  = str(r[book_col]).strip()
+                    prim  = str(r[prim_col]).strip().upper() == "Y"
                     if joink and book:
-                        books_by_joinkey.setdefault(joink, set()).add(book)
+                        d = books_by_joinkey.setdefault(joink, {})
+                        # OR across duplicates
+                        d[book] = d.get(book, False) or prim
             else:
-                st.warning(f"`CST_COST_ORG_BOOK.csv` missing needed columns (CostOrgCode, CostBookCode). Found: {list(df.columns)}")
+                st.warning(f"`CST_COST_ORG_BOOK.csv` missing needed columns (CostOrgCode, CostBookCode, PrimaryBookFlag). Found: {list(df.columns)}")
 
         # Inventory Orgs (MASTER)
         df = read_csv_from_zip(z, "INV_ORGANIZATION_PARAMETER.csv")
@@ -216,165 +223,87 @@ else:
             else:
                 st.warning(f"`ORA_CST_COST_ORG_INV.csv` missing needed columns (OrganizationCode, CostOrgCode). Found: {list(df.columns)}")
 
-    # ------------ Derived maps & display-name disambiguation ------------
-    def name_for_ident(ident: str) -> str:
-        nm = (ident_to_le_name.get(ident, "") or "").strip()
-        return nm if nm else f"[LE {ident}]"
-
+    # ------------ Derived maps ------------
     ident_to_ledgers = {}
     for led, idents in ledger_to_idents.items():
         for ident in idents:
             ident_to_ledgers.setdefault(ident, set()).add(led)
 
-    ledger_to_names = {}
+    ledger_to_le_names = {}
     for led, idents in ledger_to_idents.items():
         for ident in idents:
-            nm = name_for_ident(ident)
-            ledger_to_names.setdefault(led, []).append((ident, nm))
+            le_name = ident_to_le_name.get(ident, "").strip()
+            if le_name:
+                ledger_to_le_names.setdefault(led, set()).add(le_name)
 
-    # Disambiguate same display name under the same ledger
-    display_name_by_ident_per_ledger = {}
-    for led, pairs in ledger_to_names.items():
-        buckets = {}
-        for ident, nm in pairs:
-            buckets.setdefault(nm, []).append(ident)
-        for nm, ids in buckets.items():
-            if len(ids) == 1:
-                display_name_by_ident_per_ledger[(led, ids[0])] = nm
-            else:
-                name_collisions.append((led, nm, sorted(ids)))
-                for ident in ids:
-                    display_name_by_ident_per_ledger[(led, ident)] = f"{nm} [LE {ident}]"
+    known_pairs = set()
+    for led, idents in ledger_to_idents.items():
+        for ident in idents:
+            le_name = ident_to_le_name.get(ident, "").strip()
+            if le_name:
+                known_pairs.add((led, le_name))
 
-    # For EG-1 style back-fill
-    le_to_ledgers = {}
-    for led, pairs in ledger_to_names.items():
-        for ident, nm in pairs:
-            if nm.startswith("[LE "):
-                continue
-            le_to_ledgers.setdefault(nm, set()).add(led)
-
-    # Also build name -> idents (for unassigned unique mapping)
-    name_to_idents = {}
-    for ident, nm in ident_to_le_name.items():
-        if nm:
-            name_to_idents.setdefault(nm, set()).add(ident)
+    # CostOrg Name -> {Book: is_primary}
+    co_name_to_book_primary = {}
+    for joink, bookmap in books_by_joinkey.items():
+        co_name = co_code_to_name.get(joink, "")
+        if not co_name:
+            continue
+        m = co_name_to_book_primary.setdefault(co_name, {})
+        for bk, prim in bookmap.items():
+            m[bk] = m.get(bk, False) or bool(prim)
 
     # ===================================================
-    # Tab 1: Ledger – Legal Entity – Identifier – Business Unit
+    # Tab 1: Core Enterprise Structure (Ledger – Legal Entity – Business Unit)
     # ===================================================
-    rows1 = []
-    seen_triples = set()
-    seen_ledgers_with_bu = set()
-    seen_les_with_bu = set()
+    rows1, seen_triples, seen_ledgers_with_bu = [], set(), set()
 
-    # Reverse name→one ident (best-effort, first seen)
-    reverse_name_to_ident = {}
-    for ident, nm in ident_to_le_name.items():
-        if nm and nm not in reverse_name_to_ident:
-            reverse_name_to_ident[nm] = ident
-
-    # 1) BU-driven rows with unique back-fill
+    # Emit BU-driven rows (strict)
     for r in bu_rows:
         bu  = r["Name"]
         led = r["PrimaryLedgerName"]
         le  = r["LegalEntityName"]
+        rows1.append({"Ledger Name": led, "Legal Entity": le, "Business Unit": bu})
+        seen_triples.add((led, le, bu))
+        if led:
+            seen_ledgers_with_bu.add(led)
 
-        led = led if led in ledger_names else ""
-        le  = le if le else ""
-
-        if not led and le and le in le_to_ledgers and len(le_to_ledgers[le]) == 1:
-            led = next(iter(le_to_ledgers[le]))
-        if not le and led and led in ledger_to_names and len(ledger_to_names[led]) == 1:
-            le = ledger_to_names[led][0][1]
-
-        ident = reverse_name_to_ident.get(le, "")
-        disp  = display_name_by_ident_per_ledger.get((led, ident), le)
-
-        rows1.append({
-            "Ledger Name": led,
-            "Legal Entity": disp,
-            "Legal Entity Identifier": ident,
-            "Business Unit": bu
-        })
-        seen_triples.add((led, ident, bu))
-        if led: seen_ledgers_with_bu.add(led)
-        if le:  seen_les_with_bu.add(le)
-
-    # 2) Ledger–LE pairs with no BU (by IDENT)
+    # Add ledger–LE pairs from mapping that have no BU
     seen_pairs = {(a, b) for (a, b, _) in seen_triples}
-    for led, idents in ledger_to_idents.items():
-        if not idents:
-            if led not in seen_ledgers_with_bu:
-                rows1.append({"Ledger Name": led, "Legal Entity": "", "Legal Entity Identifier": "", "Business Unit": ""})
-            continue
-        for ident in sorted(idents):
-            if (led, ident) not in seen_pairs:
-                disp = display_name_by_ident_per_ledger.get((led, ident), name_for_ident(ident))
-                rows1.append({
-                    "Ledger Name": led,
-                    "Legal Entity": disp,
-                    "Legal Entity Identifier": ident,
-                    "Business Unit": ""
-                })
+    for led, le in sorted(known_pairs):
+        if (led, le) not in seen_pairs:
+            rows1.append({"Ledger Name": led, "Legal Entity": le, "Business Unit": ""})
 
-    # 3) Orphan ledgers (exist in master, not mapped, no BU)
-    mapped_ledgers = set(ledger_to_idents.keys())
+    # Orphan ledgers (exist, but no mapping & no BU)
+    mapped_ledgers = set(ledger_to_le_names.keys())
     for led in sorted(ledger_names - mapped_ledgers - seen_ledgers_with_bu):
-        rows1.append({"Ledger Name": led, "Legal Entity": "", "Legal Entity Identifier": "", "Business Unit": ""})
+        rows1.append({"Ledger Name": led, "Legal Entity": "", "Business Unit": ""})
 
-    # 4) Unassigned LEs (no ledger, no BU); fill ident if uniquely known for that name
-    les_known = set(ident_to_le_name.values()) | set(legal_entity_names)
-    les_in_bu = {r["LegalEntityName"] for r in bu_rows if r.get("LegalEntityName")}
-    names_in_map = {nm for pairs in ledger_to_names.values() for _, nm in pairs}
-    unassigned_les = sorted(les_known - les_in_bu - names_in_map)
-    for le in unassigned_les:
-        cand_ids = name_to_idents.get(le, set())
-        ident = next(iter(cand_ids)) if len(cand_ids) == 1 else ""
-        rows1.append({"Ledger Name": "", "Legal Entity": le, "Legal Entity Identifier": ident, "Business Unit": ""})
-
-    # ---------- Build DF with EFFECTIVE KEY (fix for hanging LEs) ----------
-    df1 = pd.DataFrame(rows1)
-
-    def _ekey(row):
-        ident = (row.get("Legal Entity Identifier") or "").strip()
-        if ident:
-            return f"ID::{ident}"
-        name = (row.get("Legal Entity") or "").strip()
-        return f"NAME::{name}"
-
-    df1["__LEKey"] = df1.apply(_ekey, axis=1)
-    df1 = df1.drop_duplicates(subset=["Ledger Name", "__LEKey", "Business Unit"]).reset_index(drop=True)
-
-    # Sort (push blanks)
+    df1 = pd.DataFrame(rows1).drop_duplicates().reset_index(drop=True)
     df1["__LedgerEmpty"] = (df1["Ledger Name"] == "").astype(int)
     df1 = (
         df1.sort_values(
             ["__LedgerEmpty", "Ledger Name", "Legal Entity", "Business Unit"],
             ascending=[True, True, True, True]
         )
-        .drop(columns=["__LedgerEmpty", "__LEKey"])
+        .drop(columns="__LedgerEmpty")
         .reset_index(drop=True)
     )
     df1.insert(0, "Assignment", range(1, len(df1) + 1))
+    df1 = _blankify(df1)
 
     # ===================================================
-    # Tab 2: Ledger – LE – Cost Org – Cost Book – Inventory Org – ProfitCenter BU – Management BU – Mfg Plant
+    # Tab 2: Inventory Org Structure (Ledger – LE – (Cost Org?) – Inventory Org – PC BU – Mgmt BU – Mfg Plant)
     # ===================================================
     rows2 = []
-
-    co_name_by_joinkey = {r["JoinKey"]: r["Name"] for r in costorg_rows if r.get("JoinKey")}
-
     for inv in invorg_rows:
         code = inv.get("Code", "")
         name = inv.get("Name", "")
         le_ident = inv.get("LEIdent", "")
-        le_name  = name_for_ident(le_ident) if le_ident else ""
+        le_name  = ident_to_le_name.get(le_ident, "") if le_ident else ""
         leds     = ident_to_ledgers.get(le_ident, set()) if le_ident else set()
-
-        co_key  = invorg_rel.get(code, "")
-        co_name = co_name_by_joinkey.get(co_key, "") if co_key else ""
-        books   = "; ".join(sorted(books_by_joinkey.get(co_key, []))) if co_key else ""
+        co_key   = invorg_rel.get(code, "")
+        co_name  = co_code_to_name.get(co_key, "") if co_key else ""
 
         if leds:
             for led in sorted(leds):
@@ -382,7 +311,6 @@ else:
                     "Ledger Name": led,
                     "Legal Entity": le_name,
                     "Cost Organization": co_name,
-                    "Cost Book": books,
                     "Inventory Org": name,
                     "Profit Center BU": inv.get("PCBU", ""),
                     "Management BU": inv.get("BUName", ""),
@@ -393,7 +321,6 @@ else:
                 "Ledger Name": "",
                 "Legal Entity": le_name,
                 "Cost Organization": co_name,
-                "Cost Book": books,
                 "Inventory Org": name,
                 "Profit Center BU": inv.get("PCBU", ""),
                 "Management BU": inv.get("BUName", ""),
@@ -401,7 +328,6 @@ else:
             })
 
     df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
-
     if not df2.empty:
         df2["__LedgerEmpty"] = (df2["Ledger Name"].fillna("") == "").astype(int)
         df2["__COEmpty"]     = (df2["Cost Organization"].fillna("") == "").astype(int)
@@ -414,47 +340,65 @@ else:
             .reset_index(drop=True)
         )
     df2.insert(0, "Assignment", range(1, len(df2) + 1))
-
-    # ----------- normalize blanks -----------
-    df1 = _blankify(df1)
     df2 = _blankify(df2)
 
-    # ----------------- Diagnostics -----------------
-    for led, idents in ledger_to_idents.items():
-        for ident in idents:
-            if name_for_ident(ident).startswith("[LE "):
-                unresolved_ident_pairs.append((led, ident))
+    # ===================================================
+    # Tab 3: Costing Structure (Ledger – LE – Cost Org – Cost Book – Primary?)
+    # ===================================================
+    rows3 = []
+    # Build: for each Cost Org, from its LE ident get leds; then books with primary flag
+    for r in costorg_rows:
+        co_name = r["Name"]
+        le_ident = r["LegalEntityIdentifier"]
+        le_name = ident_to_le_name.get(le_ident, "")
+        leds = sorted(ident_to_ledgers.get(le_ident, set())) or [""]
+        book_map = co_name_to_book_primary.get(co_name, {})
+        if not book_map:
+            # still emit a row to show the CO even if no books present
+            for led in leds:
+                rows3.append({
+                    "Ledger Name": led,
+                    "Legal Entity": le_name,
+                    "Cost Organization": co_name,
+                    "Cost Book": "",
+                    "Primary Cost Book": ""
+                })
+        else:
+            for led in leds:
+                for bk, is_primary in sorted(book_map.items(), key=lambda kv: kv[0]):
+                    rows3.append({
+                        "Ledger Name": led,
+                        "Legal Entity": le_name,
+                        "Cost Organization": co_name,
+                        "Cost Book": bk,
+                        "Primary Cost Book": "Yes" if is_primary else "No"
+                    })
 
-    diag_rows = []
-    for led, ident in unresolved_ident_pairs:
-        diag_rows.append({
-            "Issue": "Unresolved LE Identifier (name missing in XLE/backup)",
-            "Ledger": led,
-            "LegalEntityIdentifier": ident,
-            "Used Name": f"[LE {ident}]"
-        })
-    for led, nm, id_list in name_collisions:
-        diag_rows.append({
-            "Issue": f"Duplicate LE display name under ledger (split across identifiers)",
-            "Ledger": led,
-            "LegalEntityIdentifier": "; ".join(id_list),
-            "Used Name": nm
-        })
-    df_diag = pd.DataFrame(diag_rows) if diag_rows else pd.DataFrame(
-        [{"Issue": "No issues detected", "Ledger": "", "LegalEntityIdentifier": "", "Used Name": ""}]
-    )
+    df3 = pd.DataFrame(rows3).drop_duplicates().reset_index(drop=True)
+    if not df3.empty:
+        df3["__LedgerEmpty"] = (df3["Ledger Name"].fillna("") == "").astype(int)
+        df3 = (
+            df3.sort_values(
+                ["__LedgerEmpty", "Ledger Name", "Legal Entity", "Cost Organization", "Cost Book"],
+                ascending=[True, True, True, True, True]
+            )
+            .drop(columns=["__LedgerEmpty"])
+            .reset_index(drop=True)
+        )
+    df3.insert(0, "Assignment", range(1, len(df3) + 1))
+    df3 = _blankify(df3)
 
-    # ------------ Excel Output ------------
+    # ------------ Excel Output (3 tabs) ------------
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        df1.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
-        df2.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_IOs")
-        df_diag.to_excel(writer, index=False, sheet_name="Diagnostics")
+        df1.to_excel(writer, index=False, sheet_name="Core Enterprise Structure")
+        df2.to_excel(writer, index=False, sheet_name="Inventory Org Structure")
+        df3.to_excel(writer, index=False, sheet_name="Costing Structure")
 
-    st.success(f"Built {len(df1)} Tab-1 rows and {len(df2)} Tab-2 rows. (No lost hangers; identifier-safe.)")
-    st.dataframe(df1.head(25), use_container_width=True, height=300)
-    st.dataframe(df2.head(25), use_container_width=True, height=320)
-    st.dataframe(df_diag.head(25), use_container_width=True, height=220)
+    st.success(f"Built: Tab1 {len(df1)} rows • Tab2 {len(df2)} rows • Tab3 {len(df3)} rows.")
+    st.dataframe(df1.head(20), use_container_width=True, height=240)
+    st.dataframe(df2.head(20), use_container_width=True, height=280)
+    st.dataframe(df3.head(20), use_container_width=True, height=280)
 
     st.download_button(
         "⬇️ Download Excel (EnterpriseStructure.xlsx)",
@@ -462,376 +406,325 @@ else:
         file_name="EnterpriseStructure.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-# ===================== DRAW.IO DIAGRAM BLOCK (legend fix + precise direct-IO routing) =====================
-if (
-    "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
-    "df2" in locals() and isinstance(df2, pd.DataFrame)
-):
-    import xml.etree.ElementTree as ET
-    import zlib, base64, uuid
 
-    def _make_drawio_xml(df_bu: pd.DataFrame, df_tab2: pd.DataFrame) -> str:
-        # ----- geometry -----
-        W, H = 180, 48
+    # ===================== DRAW.IO DIAGRAM (with Primary Cost Book styling) =====================
+    if (
+        "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
+        "df2" in locals() and isinstance(df2, pd.DataFrame)
+    ):
+        import xml.etree.ElementTree as ET
+        import zlib, base64, uuid
 
-        # Rows
-        Y_LEDGER = 150
-        Y_LE     = 320
-        Y_BU     = 480
-        Y_CO     = 640
-        Y_CB     = 800
-        Y_IO     = 960
+        def _make_drawio_xml(df_bu: pd.DataFrame, df_tab2: pd.DataFrame) -> str:
+            # --- layout & spacing (same good defaults) ---
+            W, H = 180, 48
+            Y_LEDGER, Y_LE, Y_BU, Y_CO, Y_CB, Y_IO = 150, 320, 480, 640, 800, 960
 
-        # Elbows (kept low & parallel)
-        def low_elbow(y_child, y_parent, bias=0.75):
-            return int(y_parent + (y_child - y_parent) * bias)
-        ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)
-        ELBOW_BU_TO_LE  = low_elbow(Y_BU, Y_LE)
-        ELBOW_CO_TO_LE  = low_elbow(Y_CO, Y_LE)
-        ELBOW_CB_TO_CO  = low_elbow(Y_CB, Y_CO)
-        ELBOW_IO_TO_CO  = low_elbow(Y_IO, Y_CO)
+            def low_elbow(y_child, y_parent, bias=0.75):
+                return int(y_parent + (y_child - y_parent) * bias)
+            ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)
+            ELBOW_BU_TO_LE  = low_elbow(Y_BU, Y_LE)
+            ELBOW_CO_TO_LE  = low_elbow(Y_CO, Y_LE)
+            ELBOW_CB_TO_CO  = low_elbow(Y_CB, Y_CO)
+            ELBOW_IO_TO_CO  = low_elbow(Y_IO, Y_CO)
 
-        # Lanes / spacing
-        BOOK_OFFSET_LEFT = 140
-        BU_LANE_LEFT     = BOOK_OFFSET_LEFT
+            BOOK_OFFSET_LEFT = 140
+            MIN_GAP = 40
+            def spread(base): return max(base, W + MIN_GAP)
+            BU_SPREAD_BASE, CO_SPREAD_BASE = 190, 220
+            IO_UNDER_CO_BASE, BOOK_SPREAD_BASE = 170, 160
+            LEDGER_BLOCK_GAP, CLUSTER_GAP, LEFT_PAD = 120, 360, 260
+            MIN_UMBRELLA_GAP = 120
 
-        MIN_GAP = 40
-        BU_SPREAD_BASE   = 190
-        CO_SPREAD_BASE   = 220
-        IO_UNDER_CO_BASE = 170
-        BOOK_SPREAD_BASE = 160
-        DIO_SPREAD_BASE  = 190
+            # Direct-IO basin parameters
+            DIO_BASIN_GAP  = 160
+            MIN_DIO_BRANCH = 120
 
-        def spread(base): return max(base, W + MIN_GAP)
+            # --- styles ---
+            S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
+            S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
+            S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
+            S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2F0C2;strokeColor=#008000;fontSize=12;"
+            S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#A0D080;strokeColor=#004d00;fontSize=12;"
+            S_CB_P   = "rounded=1;whiteSpace=wrap;html=1;fillColor=#A0D080;strokeColor=#004d00;strokeWidth=2;fontSize=12;"
+            S_IO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#004080;fontSize=12;"
+            S_IO_PLT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
 
-        LEDGER_BLOCK_GAP = 120
-        CLUSTER_GAP      = 360
-        LEFT_PAD         = 260
-        MIN_UMBRELLA_GAP = 120
+            S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
+                        "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
 
-        # Direct-IO basin
-        DIO_BASIN_GAP    = 160   # distance from CO umbrella right edge to DIO basin center
-        MIN_DIO_BRANCH   = 120   # minimum push-out of the LE→DIO bus vs LE center
+            # --- normalize input ---
+            df_bu = df_bu[["Ledger Name", "Legal Entity", "Business Unit"]].copy().fillna("").astype(str)
+            df = df_tab2[[
+                "Ledger Name","Legal Entity","Cost Organization",
+                "Inventory Org","Manufacturing Plant"
+            ]].copy().fillna("").astype(str)
 
-        # ----- styles -----
-        S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
-        S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
-        S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
-        S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2F0C2;strokeColor=#008000;fontSize=12;"
-        S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#A0D080;strokeColor=#004d00;fontSize=12;"
-        S_IO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#004080;fontSize=12;"
-        S_IO_PLT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
+            ledgers_all = sorted({*df_bu["Ledger Name"].unique(), *df["Ledger Name"].unique()} - {""})
 
-        # Ensure LE edges enter at bottom-center; IO edges exit at top-center
-        S_EDGE = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
-                  "jettySize=auto;strokeColor=#666666;"
-                  "exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
+            # --- maps (by names for display) ---
+            le_map, bu_map, co_map = {}, {}, {}
+            cb_by_co = {}     # (L,E,C) -> [book,...]
+            cbp_flag = {}     # (L,E,C,book) -> True/False (primary)
+            io_by_co = {}     # (L,E,C) -> [{"Name":..., "Mfg":...}, ...]
+            dio_by_le = {}    # (L,E)   -> [{"Name":..., "Mfg":...}, ...]
 
-        # ----- normalize -----
-        df_bu = df_bu.fillna("").copy()
-        df2   = df_tab2.fillna("").copy()
+            # Build LE set
+            tmp = pd.concat([df_bu[["Ledger Name","Legal Entity"]],
+                             df[["Ledger Name","Legal Entity"]]]).drop_duplicates()
+            for _, r in tmp.iterrows():
+                L, E = r["Ledger Name"], r["Legal Entity"]
+                if L and E:
+                    le_map.setdefault(L, set()).add(E)
 
-        # ledger → {LE}
-        ledger_to_les = {}
-        for _, r in pd.concat([
-            df_bu[["Ledger Name", "Legal Entity"]],
-            df2[["Ledger Name", "Legal Entity"]],
-        ]).drop_duplicates().iterrows():
-            L, E = r["Ledger Name"], r["Legal Entity"]
-            if L and E:
-                ledger_to_les.setdefault(L, set()).add(E)
+            # BUs
+            for _, r in df_bu.iterrows():
+                L, E, B = r["Ledger Name"], r["Legal Entity"], r["Business Unit"]
+                if L and E and B:
+                    bu_map.setdefault((L,E), set()).add(B)
 
-        # BU map
-        bu_by_le = {}
-        for _, r in df_bu.iterrows():
-            L, E, B = r["Ledger Name"], r["Legal Entity"], r["Business Unit"]
-            if L and E and B:
-                bu_by_le.setdefault((L, E), set()).add(B)
+            # COs & IOs-under-CO
+            for _, r in df.iterrows():
+                L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
+                if L and E and C:
+                    co_map.setdefault((L,E), set()).add(C)
 
-        # CO / books / IO-under-CO
-        co_by_le, cb_by_co, io_by_co = {}, {}, {}
-        for _, r in df2.iterrows():
-            L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
-            CB, IO, MFG = r["Cost Book"], r["Inventory Org"], (r.get("Manufacturing Plant","") or "")
-            if L and E and C:
-                co_by_le.setdefault((L, E), set()).add(C)
-                if CB:
-                    for bk in [b.strip() for b in CB.split(";") if b.strip()]:
-                        cb_by_co.setdefault((L, E, C), set()).add(bk)
-                if IO:
-                    rec = {"Name": IO, "Mfg": str(MFG).strip().lower() in ("yes","y","true","1")}
-                    io_by_co.setdefault((L, E, C), [])
-                    if all(x["Name"] != rec["Name"] for x in io_by_co[(L, E, C)]):
-                        io_by_co[(L, E, C)].append(rec)
+            # Books (+ primary) for each CO name
+            # co_name_to_book_primary is available from outer scope
+            from collections import defaultdict
+            for (L,E), cos in list(co_map.items()):
+                for C in cos:
+                    book_map = co_name_to_book_primary.get(C, {})
+                    if book_map:
+                        cb_by_co.setdefault((L,E,C), [])
+                        for bk, is_p in sorted(book_map.items()):
+                            cb_by_co[(L,E,C)].append(bk)
+                            cbp_flag[(L,E,C,bk)] = bool(is_p)
 
-        # Direct IOs (no CO)
-        dio_by_le = {}
-        for _, r in df2.iterrows():
-            L, E, C, IO = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"], r["Inventory Org"]
-            MFG = (r.get("Manufacturing Plant","") or "")
-            if L and E and not C and IO:
-                rec = {"Name": IO, "Mfg": str(MFG).strip().lower() in ("yes","y","true","1")}
-                dio_by_le.setdefault((L, E), [])
-                if all(x["Name"] != rec["Name"] for x in dio_by_le[(L, E)]):
-                    dio_by_le[(L, E)].append(rec)
-
-        # helpers
-        def centered_positions(center_x, n, base_spread):
-            s = spread(base_spread)
-            if n <= 0: return []
-            if n == 1: return [center_x]
-            start = center_x - (s * (n - 1)) / 2.0
-            return [start + i * s for i in range(n)]
-
-        # ----- place -----
-        next_x = LEFT_PAD
-        led_x, le_x = {}, {}
-        bu_x, co_x, cb_x = {}, {}, {}
-        io_x, dio_x = {}, {}
-
-        for L in sorted(ledger_to_les.keys()):
-            centers = []
-            prev_umbrella_max_x = None
-
-            for E in sorted(ledger_to_les[L]):
-                cx = next_x
-
-                co_center  = cx
-                bu_center  = cx - BU_LANE_LEFT
-
-                has_co  = len(co_by_le.get((L, E), [])) > 0
-                has_dio = len(dio_by_le.get((L, E), [])) > 0
-                if not has_co and not has_dio:
-                    bu_center = cx
-
-                # BUs
-                bu_list = sorted(bu_by_le.get((L, E), []))
-                bu_positions = centered_positions(bu_center, len(bu_list), BU_SPREAD_BASE)
-                for x, b in zip(bu_positions, bu_list):
-                    bu_x[(L, E, b)] = x
-
-                # COs (+ books + IO-under-CO)
-                co_list = sorted(co_by_le.get((L, E), []))
-                co_positions = centered_positions(co_center, len(co_list), CO_SPREAD_BASE)
-                co_rightmost = cx
-                for x, c in zip(co_positions, co_list):
-                    co_x[(L, E, c)] = x
-                    books = sorted(cb_by_co.get((L, E, c), []))
-                    for k, bk in enumerate(books):
-                        cb_x[(L, E, c, bk)] = x - BOOK_OFFSET_LEFT + k * spread(BOOK_SPREAD_BASE)
-                    ios = sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])
-                    io_positions = centered_positions(x, len(ios), IO_UNDER_CO_BASE)
-                    for xio, rec in zip(io_positions, ios):
-                        io_x[(L, E, c, rec["Name"])] = (xio, rec["Mfg"])
-                    xs_tmp = [x]
-                    xs_tmp += [cb_x[(L, E, c, bk)] for bk in books]
-                    xs_tmp += [io_x[(L, E, c, r["Name"])][0] for r in ios]
-                    if xs_tmp:
-                        co_rightmost = max(co_rightmost, max(xs_tmp))
-
-                # Dynamic DIO basin
-                if has_dio:
-                    dios = sorted(dio_by_le.get((L, E), []), key=lambda d: d["Name"])
-                    if co_list:
-                        co_umbrella_right = max(co_rightmost + W/2, (max(co_positions) + W/2) if co_positions else cx + W/2)
+            # IO-under-CO and Direct-IO are derived from df_tab2 + presence of Cost Org name
+            for _, r in df.iterrows():
+                L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
+                IO, MFG = r["Inventory Org"], r["Manufacturing Plant"]
+                if L and E and IO:
+                    if C:
+                        io_by_co.setdefault((L,E,C), [])
+                        rec = {"Name": IO, "Mfg": (MFG or "")}
+                        if all(x["Name"] != IO for x in io_by_co[(L,E,C)]):
+                            io_by_co[(L,E,C)].append(rec)
                     else:
-                        co_umbrella_right = cx + W/2
-                    dio_center = co_umbrella_right + DIO_BASIN_GAP + W/2
-                    dio_positions = centered_positions(dio_center, len(dios), DIO_SPREAD_BASE)
-                    for xio, rec in zip(dio_positions, dios):
-                        dio_x[(L, E, rec["Name"])] = (xio, rec["Mfg"])
+                        dio_by_le.setdefault((L,E), [])
+                        rec = {"Name": IO, "Mfg": (MFG or "")}
+                        if all(x["Name"] != IO for x in dio_by_le[(L,E)]):
+                            dio_by_le[(L,E)].append(rec)
 
-                le_x[(L, E)] = cx
+            # --- placement helpers ---
+            next_x = LEFT_PAD
+            led_x, le_x, bu_x, co_x, cb_x, io_x, dio_x = {}, {}, {}, {}, {}, {}, {}
 
-                # umbrella span
-                xs_span = [cx] + bu_positions + co_positions
-                xs_span += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
-                for c in co_list:
-                    xs_span += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
-                    xs_span += [io_x[(L, E, c, r["Name"])][0] for r in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
-                min_x = min(xs_span) - W/2
-                max_x = max(xs_span) + W/2
+            def centered_positions(center_x, n, base_spread):
+                s = spread(base_spread)
+                if n <= 0: return []
+                if n == 1: return [center_x]
+                start = center_x - (s * (n - 1)) / 2.0
+                return [start + i * s for i in range(n)]
 
-                if prev_umbrella_max_x is not None and min_x < prev_umbrella_max_x + MIN_UMBRELLA_GAP:
-                    shift = (prev_umbrella_max_x + MIN_UMBRELLA_GAP) - min_x
-                    le_x[(L, E)] = cx + shift
-                    for k in list(bu_x):
-                        if k[0] == L and k[1] == E: bu_x[k] += shift
-                    for k in list(co_x):
-                        if k[0] == L and k[1] == E: co_x[k] += shift
-                    for k in list(cb_x):
-                        if k[0] == L and k[1] == E: cb_x[k] += shift
-                    for k in list(io_x):
-                        if k[0] == L and k[1] == E: io_x[k] = (io_x[k][0] + shift, io_x[k][1])
-                    for k in list(dio_x):
-                        if k[0] == L and k[1] == E: dio_x[k] = (dio_x[k][0] + shift, dio_x[k][1])
+            prev_umbrella_max_x = None
+            for L in ledgers_all:
+                les = sorted(le_map.get(L, []))
+                centers = []
+                for E in les:
+                    cx = next_x
+                    co_center = cx
+                    bu_center = cx - 140  # BU lane slightly left
 
-                    xs_span = [le_x[(L, E)]]
-                    xs_span += [bu_x[(L, E, b)] for b in bu_list]
-                    xs_span += [co_x[(L, E, c)] for c in co_list]
-                    xs_span += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
-                    for c in co_list:
-                        xs_span += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
-                        xs_span += [io_x[(L, E, c, r["Name"])][0] for r in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
+                    # BUs
+                    buses = sorted(bu_map.get((L,E), []))
+                    for x, b in zip(centered_positions(bu_center, len(buses), BU_SPREAD_BASE), buses):
+                        bu_x[(L,E,b)] = x
+
+                    # COs
+                    cos = sorted(co_map.get((L,E), []))
+                    for x, c in zip(centered_positions(co_center, len(cos), CO_SPREAD_BASE), cos):
+                        co_x[(L,E,c)] = x
+                        # Books (left of CO)
+                        books = sorted(cb_by_co.get((L,E,c), []))
+                        for k, bk in enumerate(books):
+                            cb_x[(L,E,c,bk)] = x - BOOK_OFFSET_LEFT + k * spread(BOOK_SPREAD_BASE)
+                        # IOs under CO
+                        ios = sorted(io_by_co.get((L,E,c), []), key=lambda d: d["Name"])
+                        for xio, rec in zip(centered_positions(x, len(ios), IO_UNDER_CO_BASE), ios):
+                            io_x[(L,E,c,rec["Name"])] = (xio, rec["Mfg"])
+
+                    # Direct-IO basin to the right if present
+                    dlist = sorted(dio_by_le.get((L,E), []), key=lambda d: d["Name"])
+                    if dlist:
+                        # place basin to the right of the rightmost CO/book/IO element
+                        xs = [cx] + [co_x[(L,E,c)] for c in cos]
+                        for c in cos:
+                            xs += [cb_x[(L,E,c,bk)] for bk in cb_by_co.get((L,E,c),[])]
+                            xs += [io_x[(L,E,c,r["Name"])][0] for r in io_by_co.get((L,E,c),[])]
+                        right_edge = max(xs) if xs else cx
+                        dio_center = right_edge + DIO_BASIN_GAP + W/2
+                        for xio, rec in zip(centered_positions(dio_center, len(dlist), IO_UNDER_CO_BASE), dlist):
+                            dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
+
+                    le_x[(L,E)] = cx
+                    centers.append(cx)
+
+                    # manage umbrella spacing
+                    xs_span = [cx]
+                    xs_span += [bu_x[(L,E,b)] for b in buses]
+                    xs_span += [co_x[(L,E,c)] for c in cos]
+                    for c in cos:
+                        xs_span += [cb_x[(L,E,c,bk)] for bk in cb_by_co.get((L,E,c),[])]
+                        xs_span += [io_x[(L,E,c,r["Name"])][0] for r in io_by_co.get((L,E,c),[])]
+                    xs_span += [v[0] for k,v in dio_x.items() if k[:2]==(L,E)]
                     min_x = min(xs_span) - W/2
-                    max_x = max(xs_span) + W/2
+                    max_x_ = max(xs_span) + W/2
 
-                prev_umbrella_max_x = max_x
-                next_x = max_x + LEDGER_BLOCK_GAP
-                centers.append(le_x[(L, E)])
+                    if prev_umbrella_max_x is not None and min_x < prev_umbrella_max_x + MIN_UMBRELLA_GAP:
+                        shift = (prev_umbrella_max_x + MIN_UMBRELLA_GAP) - min_x
+                        le_x[(L,E)] += shift
+                        for d in [bu_x, co_x, cb_x, io_x, dio_x]:
+                            for k in list(d.keys()):
+                                if k[0]==L and k[1]==E:
+                                    if d is io_x or d is dio_x:
+                                        d[k] = (d[k][0] + shift, d[k][1])
+                                    else:
+                                        d[k] = d[k] + shift
+                        max_x_ += shift
 
-            led_x[L] = int(sum(centers)/len(centers)) if centers else next_x
-            next_x += CLUSTER_GAP
+                    prev_umbrella_max_x = max_x_
+                    next_x = max_x_ + LEDGER_BLOCK_GAP
 
-        # ----- XML skeleton -----
-        mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
-        diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
-        model   = ET.SubElement(diagram, "mxGraphModel", attrib={
-            "dx":"1284","dy":"682","grid":"1","gridSize":"10","page":"1","pageWidth":"1920","pageHeight":"1080","background":"#ffffff"
-        })
-        root    = ET.SubElement(model, "root")
-        ET.SubElement(root, "mxCell", attrib={"id":"0"})
-        ET.SubElement(root, "mxCell", attrib={"id":"1","parent":"0"})
+                led_x[L] = int(sum(centers)/len(centers)) if centers else next_x
+                next_x += CLUSTER_GAP
 
-        def add_vertex(label, style, x, y, w=W, h=H):
-            vid = uuid.uuid4().hex[:8]
-            c = ET.SubElement(root,"mxCell",attrib={"id":vid,"value":label,"style":style,"vertex":"1","parent":"1"})
-            ET.SubElement(c,"mxGeometry",attrib={"x":str(int(x)),"y":str(int(y)),"width":str(w),"height":str(h),"as":"geometry"})
-            return vid
-
-        def add_edge_with_elbow(src_id, tgt_id, src_center_x, tgt_center_x, elbow_y):
-            eid = uuid.uuid4().hex[:8]
-            c = ET.SubElement(root, "mxCell", attrib={
-                "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
-                "source": src_id, "target": tgt_id
+            # --- XML skeleton ---
+            mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
+            diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
+            model   = ET.SubElement(diagram, "mxGraphModel", attrib={
+                "dx":"1284","dy":"682","grid":"1","gridSize":"10","page":"1","pageWidth":"1920","pageHeight":"1080","background":"#ffffff"
             })
-            g = ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
-            arr = ET.SubElement(g, "Array", attrib={"as": "points"})
-            ET.SubElement(arr, "mxPoint", attrib={"x": str(int(src_center_x)), "y": str(int(elbow_y))})
-            ET.SubElement(arr, "mxPoint", attrib={"x": str(int(tgt_center_x)), "y": str(int(elbow_y))})
+            root    = ET.SubElement(model, "root")
+            ET.SubElement(root, "mxCell", attrib={"id":"0"})
+            ET.SubElement(root, "mxCell", attrib={"id":"1","parent":"0"})
 
-        def add_edge_points(src_id, tgt_id, points):
-            """points = [(x1,y1), (x2,y2), ...]"""
-            eid = uuid.uuid4().hex[:8]
-            c = ET.SubElement(root, "mxCell", attrib={
-                "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
-                "source": src_id, "target": tgt_id
-            })
-            g = ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
-            arr = ET.SubElement(g, "Array", attrib={"as": "points"})
-            for (px, py) in points:
-                ET.SubElement(arr, "mxPoint", attrib={"x": str(int(px)), "y": str(int(py))})
+            def add_vertex(label, style, x, y, w=W, h=H):
+                vid = uuid.uuid4().hex[:8]
+                c = ET.SubElement(root, "mxCell", attrib={"id":vid,"value":label,"style":style,"vertex":"1","parent":"1"})
+                ET.SubElement(c, "mxGeometry", attrib={"x":str(int(x)), "y":str(int(y)), "width":str(w), "height":str(h), "as":"geometry"})
+                return vid
 
-        def cx(x_left):  # left x -> center x
-            return int(x_left + W/2)
+            def add_edge_points(src_id, tgt_id, points):
+                eid = uuid.uuid4().hex[:8]
+                c = ET.SubElement(root, "mxCell", attrib={
+                    "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
+                    "source": src_id, "target": tgt_id
+                })
+                g = ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
+                arr = ET.SubElement(g, "Array", attrib={"as": "points"})
+                for (px, py) in points:
+                    ET.SubElement(arr, "mxPoint", attrib={"x": str(int(px)), "y": str(int(py))})
 
-        # Nodes
-        id_map = {}
-        for L in sorted(led_x.keys()):
-            id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
+            def add_edge_with_elbow(src_id, tgt_id, src_center_x, tgt_center_x, elbow_y):
+                add_edge_points(src_id, tgt_id, [(src_center_x, elbow_y), (tgt_center_x, elbow_y)])
 
-        for (L, E), x in le_x.items():
-            id_map[("E", L, E)] = add_vertex(E, S_LE, x, Y_LE)
-            add_edge_with_elbow(id_map[("E", L, E)], id_map[("L", L)], cx(x), cx(led_x[L]), ELBOW_LE_TO_LED)
+            def cx(x_left): return int(x_left + W/2)
 
-        for (L, E, b), x in bu_x.items():
-            id_map[("B", L, E, b)] = add_vertex(b, S_BU, x, Y_BU)
-            add_edge_with_elbow(id_map[("B", L, E, b)], id_map[("E", L, E)], cx(x), cx(le_x[(L, E)]), ELBOW_BU_TO_LE)
+            # vertices
+            id_map = {}
+            for L in ledgers_all:
+                id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
 
-        for (L, E, c), x in co_x.items():
-            id_map[("C", L, E, c)] = add_vertex(c, S_CO, x, Y_CO)
-            add_edge_with_elbow(id_map[("C", L, E, c)], id_map[("E", L, E)], cx(x), cx(le_x[(L, E)]), ELBOW_CO_TO_LE)
+            for (L,E), x in le_x.items():
+                id_map[("E", L, E)] = add_vertex(E, S_LE, x, Y_LE)
+                add_edge_with_elbow(id_map[("E", L, E)], id_map[("L", L)], cx(x), cx(led_x[L]), ELBOW_LE_TO_LED)
 
-        for (L, E, c, bk), x in cb_x.items():
-            id_map[("CB", L, E, c, bk)] = add_vertex(bk, S_CB, x, Y_CB)
-            add_edge_with_elbow(id_map[("CB", L, E, c, bk)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L, E, c)]), ELBOW_CB_TO_CO)
+            for (L,E,b), x in bu_x.items():
+                id_map[("B", L, E, b)] = add_vertex(b, S_BU, x, Y_BU)
+                add_edge_with_elbow(id_map[("B", L, E, b)], id_map[("E", L, E)], cx(x), cx(le_x[(L,E)]), ELBOW_BU_TO_LE)
 
-        for (L, E, c, name), (x, is_mfg) in io_x.items():
-            style = S_IO_PLT if is_mfg else S_IO
-            label = f"🏭 {name}" if is_mfg else name
-            id_map[("IO", L, E, c, name)] = add_vertex(label, style, x, Y_IO)
-            add_edge_with_elbow(id_map[("IO", L, E, c, name)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L, E, c)]), ELBOW_IO_TO_CO)
+            for (L,E,c), x in co_x.items():
+                id_map[("C", L, E, c)] = add_vertex(c, S_CO, x, Y_CO)
+                add_edge_with_elbow(id_map[("C", L, E, c)], id_map[("E", L, E)], cx(x), cx(le_x[(L,E)]), ELBOW_CO_TO_LE)
 
-        # ---- Direct IO edges with bus routing aligned to BU level ----
-        # Build per-LE bus X at BU level, and a mid-depth (between BU and IO) for multi-IO fans.
-        dio_bus_x = {}     # (L,E) -> x at BU level where the right-branch bus sits
-        dio_mid_y = {}     # (L,E) -> y to create a clean vertical before reaching BU level (multi-IO)
-        for (L, E), x_le in le_x.items():
-            xs = [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
-            if xs:
-                le_center = cx(x_le)
-                avg_dio   = sum(xs) / len(xs)
-                # bus sits at least MIN_DIO_BRANCH to the right of LE center, else halfway toward the IO cluster
-                bus_x = max(int((le_center + avg_dio) / 2), le_center + MIN_DIO_BRANCH)
-                dio_bus_x[(L, E)] = bus_x
-                # mid point between BU and IO rows for cleaner rise when >1 IO
-                dio_mid_y[(L, E)] = int((Y_BU + Y_IO) / 2)
+            for (L,E,c,bk), x in cb_x.items():
+                is_p = bool(cbp_flag.get((L,E,c,bk), False))
+                style = S_CB_P if is_p else S_CB
+                id_map[("CB", L, E, c, bk)] = add_vertex(bk, style, x, Y_CB)
+                add_edge_with_elbow(id_map[("CB", L, E, c, bk)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L,E,c)]), ELBOW_CB_TO_CO)
 
-        for (L, E, name), (x_io, is_mfg) in dio_x.items():
-            style = S_IO_PLT if is_mfg else S_IO
-            label = f"🏭 {name}" if is_mfg else name
-            key = ("DIO", L, E, name)
-            id_map[key] = add_vertex(label, style, x_io, Y_IO)
+            for (L,E,c,name), (x, is_mfg) in io_x.items():
+                style = S_IO_PLT if str(is_mfg).lower() in ("yes","y","true","1") else S_IO
+                label = f"🏭 {name}" if style == S_IO_PLT else name
+                id_map[("IO", L, E, c, name)] = add_vertex(label, style, x, Y_IO)
+                add_edge_with_elbow(id_map[("IO", L, E, c, name)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L,E,c)]), ELBOW_IO_TO_CO)
 
-            le_center_x = cx(le_x[(L, E)])
-            bus_x = dio_bus_x.get((L, E), le_center_x + MIN_DIO_BRANCH)
+            # Direct IO edges: vertical up to BU level, branch right bus, then to LE x, then up
+            dio_bus_x = {}
+            for (L,E), lst in dio_by_le.items():
+                if not lst: continue
+                le_center = cx(le_x[(L,E)])
+                xs = [dio_x[(L,E,r["Name"])][0] for r in lst]
+                avg_x = sum(xs)/len(xs)
+                bus_x = max(int((le_center + avg_x)/2), le_center + MIN_DIO_BRANCH)
+                dio_bus_x[(L,E)] = bus_x
 
-            # Build the waypoint chain:
-            # 1) vertical up from IO to a mid-level (if multiple IOs) else straight to BU level
-            # 2) horizontal to the bus_x at that same y
-            # 3) horizontal to LE center at BU level
-            # 4) up into LE bottom (handled by target entry constraint)
-            # Choose first Y waypoint
-            io_count = sum(1 for k in dio_x if k[:2] == (L, E))
-            first_y = (dio_mid_y[(L, E)] if io_count >= 2 else Y_BU)
+            for (L,E,name), (x, is_mfg) in dio_x.items():
+                style = S_IO_PLT if str(is_mfg).lower() in ("yes","y","true","1") else S_IO
+                label = f"🏭 {name}" if style == S_IO_PLT else name
+                key = ("DIO", L, E, name)
+                id_map[key] = add_vertex(label, style, x, Y_IO)
 
-            points = [
-                (cx(x_io), first_y),      # rise from IO to mid/BU level
-                (bus_x,   first_y),       # slide to the right branch
-                (le_center_x, Y_BU),      # align to LE x at BU level
-            ]
-            add_edge_points(id_map[key], id_map[("E", L, E)], points)
+                le_center_x = cx(le_x[(L,E)])
+                bus_x = dio_bus_x.get((L,E), le_center_x + MIN_DIO_BRANCH)
+                points = [
+                    (cx(x), (Y_BU + Y_IO)//2 if len(dio_by_le.get((L,E), []))>=2 else Y_BU),
+                    (bus_x, (Y_BU + Y_IO)//2 if len(dio_by_le.get((L,E), []))>=2 else Y_BU),
+                    (le_center_x, Y_BU),
+                ]
+                add_edge_points(id_map[key], id_map[("E", L, E)], points)
 
-        # ----- Legend (smaller white background) -----
-        def add_legend(x=20, y=20):
-            # smaller panel: width 190, height 160
-            _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 190, 160)
-            items = [
-                ("Ledger", "#FFE6E6", None),
-                ("Legal Entity", "#FFE2C2", None),
-                ("Business Unit", "#FFF1B3", None),
-                ("Cost Org", "#C2F0C2", None),
-                ("Cost Book", "#A0D080", None),
-                ("Inventory Org", "#C2E0F9", None),
-                ("Manufacturing Plant (IO)", "#C2E0F9", "bold"),
-            ]
-            for i, (lbl, col, flavor) in enumerate(items):
-                style = f"rounded=1;fillColor={col};strokeColor=#666666;"
-                if flavor == "bold":
-                    style = "rounded=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;"
-                add_vertex("", style, x+10, y+26+i*19, 16, 10)
-                add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=11;", x+32, y+22+i*19, 150, 18)
+            # Legend (smaller background, includes Primary CB)
+            def add_legend(x=20, y=20):
+                _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 190, 178)
+                items = [
+                    ("Ledger", "#FFE6E6", None),
+                    ("Legal Entity", "#FFE2C2", None),
+                    ("Business Unit", "#FFF1B3", None),
+                    ("Cost Org", "#C2F0C2", None),
+                    ("Cost Book", "#A0D080", None),
+                    ("Primary Cost Book", "#A0D080", "bold"),
+                    ("Inventory Org", "#C2E0F9", None),
+                    ("Manufacturing Plant (IO)", "#C2E0F9", "io_bold"),
+                ]
+                yoff = 26
+                for i, (lbl, col, flavor) in enumerate(items):
+                    if flavor == "bold":
+                        style = "rounded=1;fillColor=#A0D080;strokeColor=#004d00;strokeWidth=2;"
+                    elif flavor == "io_bold":
+                        style = "rounded=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;"
+                    else:
+                        style = f"rounded=1;fillColor={col};strokeColor=#666666;"
+                    add_vertex("", style, x+10, y+yoff+i*19, 16, 10)
+                    add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=11;", x+32, y+yoff-4+i*19, 150, 18)
 
-        add_legend()
-        return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
+            add_legend()
+            return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
 
-    def _drawio_url_from_xml(xml: str) -> str:
-        raw = zlib.compress(xml.encode("utf-8"), level=9)[2:-4]
-        b64 = base64.b64encode(raw).decode("ascii")
-        return f"https://app.diagrams.net/?title=EnterpriseStructure.drawio#R{b64}"
+        def _drawio_url_from_xml(xml: str) -> str:
+            raw = zlib.compress(xml.encode("utf-8"), level=9)[2:-4]
+            b64 = base64.b64encode(raw).decode("ascii")
+            return f"https://app.diagrams.net/?title=EnterpriseStructure.drawio#R{b64}"
 
-    _xml = _make_drawio_xml(df1, df2)
+        _xml = _make_drawio_xml(df1, df2)
 
-    st.download_button(
-        "⬇️ Download diagram (.drawio)",
-        data=_xml.encode("utf-8"),
-        file_name="EnterpriseStructure.drawio",
-        mime="application/xml",
-        use_container_width=True
-    )
-    st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
-# ===================== END DRAW.IO BLOCK =====================
-
-
-
-
+        st.download_button(
+            "⬇️ Download diagram (.drawio)",
+            data=_xml.encode("utf-8"),
+            file_name="EnterpriseStructure.drawio",
+            mime="application/xml",
+            use_container_width=True
+        )
+        st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
