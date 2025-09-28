@@ -347,3 +347,147 @@ else:
     )
 
     # Diagram section intentionally deferred until Excel is signed off.
+# ===================== DRAW.IO DIAGRAM BLOCK (with Inventory Orgs) =====================
+if (
+    "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
+    "df2" in locals() and isinstance(df2, pd.DataFrame)
+):
+    import xml.etree.ElementTree as ET
+    import zlib, base64, uuid
+
+    def _make_drawio_xml(df_bu: pd.DataFrame, df_io: pd.DataFrame) -> str:
+        # --- layout & spacing ---
+        W, H       = 180, 48
+        X_STEP     = 230
+        PAD_GROUP  = 60
+        LEFT_PAD   = 260
+        RIGHT_PAD  = 200
+
+        Y_LEDGER   = 150
+        Y_LE       = 310
+        Y_BU       = 470
+        Y_CO       = 630
+        Y_CB       = 790
+        Y_IO       = 950  # Inventory Orgs sit *below* Cost Books
+
+        # --- styles ---
+        S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
+        S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
+        S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
+        S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#E2F7E2;strokeColor=#3D8B3D;fontSize=12;"
+        S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#7FBF7F;strokeColor=#2F7D2F;fontSize=12;"
+        # Inventory Orgs
+        S_IO      = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#2F71A8;fontSize=12;"
+        S_IO_PLANT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
+
+        S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
+                    "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
+
+        # --- normalize inputs ---
+        df_io = df_io.fillna("")
+        df_bu = df_bu.fillna("")
+
+        ledgers_all = sorted([x for x in set(df_bu["Ledger Name"]) | set(df_io["Ledger Name"]) if x])
+
+        # maps
+        le_map, bu_map, co_map, cb_map, io_map = {}, {}, {}, {}, {}
+
+        for _, r in pd.concat([df_bu[["Ledger Name","Legal Entity"]],
+                               df_io[["Ledger Name","Legal Entity"]]]).drop_duplicates().iterrows():
+            if r["Ledger Name"] and r["Legal Entity"]:
+                le_map.setdefault(r["Ledger Name"], set()).add(r["Legal Entity"])
+
+        for _, r in df_bu.iterrows():
+            if r["Ledger Name"] and r["Legal Entity"] and r["Business Unit"]:
+                bu_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Business Unit"])
+
+        for _, r in df_io.iterrows():
+            if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"]:
+                co_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Cost Organization"])
+
+        for _, r in df_io.iterrows():
+            if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"]:
+                cb_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]), set()).add(r["Cost Book"])
+
+        for _, r in df_io.iterrows():
+            if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"] and r["Inventory Org"]:
+                io_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"], r["Cost Book"]), []).append({
+                    "Name": r["Inventory Org"],
+                    "Mfg": str(r.get("Manufacturing Plant", "")).strip()
+                })
+
+        # --- XML skeleton ---
+        mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
+        diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
+        model   = ET.SubElement(diagram, "mxGraphModel", attrib={
+            "dx": "1284", "dy": "682", "grid": "1", "gridSize": "10",
+            "page": "1", "pageWidth": "1920", "pageHeight": "1080",
+            "background": "#ffffff"
+        })
+        root    = ET.SubElement(model, "root")
+        ET.SubElement(root, "mxCell", attrib={"id": "0"})
+        ET.SubElement(root, "mxCell", attrib={"id": "1", "parent": "0"})
+
+        def add_vertex(label, style, x, y):
+            vid = uuid.uuid4().hex[:8]
+            c = ET.SubElement(root, "mxCell", attrib={
+                "id": vid, "value": label, "style": style, "vertex": "1", "parent": "1"})
+            ET.SubElement(c, "mxGeometry", attrib={
+                "x": str(int(x)), "y": str(int(y)), "width": str(W), "height": str(H), "as": "geometry"})
+            return vid
+
+        def add_edge(src, tgt, dashed=False):
+            eid = uuid.uuid4().hex[:8]
+            style = S_EDGE + ("dashed=1;" if dashed else "")
+            c = ET.SubElement(root, "mxCell", attrib={
+                "id": eid, "value": "", "style": style, "edge": "1", "parent": "1",
+                "source": src, "target": tgt})
+            ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
+
+        # --- build nodes ---
+        id_map = {}
+        next_x = LEFT_PAD
+
+        for L in ledgers_all:
+            id_map[("L", L)] = add_vertex(L, S_LEDGER, next_x, Y_LEDGER)
+            les = sorted(le_map.get(L, []))
+            for le in les:
+                id_map[("E", L, le)] = add_vertex(le, S_LE, next_x, Y_LE)
+                add_edge(id_map[("E", L, le)], id_map[("L", L)])
+                # BUs
+                for b in sorted(bu_map.get((L, le), [])):
+                    id_map[("B", L, le, b)] = add_vertex(b, S_BU, next_x, Y_BU)
+                    add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
+                # Cost Orgs
+                for c in sorted(co_map.get((L, le), [])):
+                    id_map[("C", L, le, c)] = add_vertex(c, S_CO, next_x, Y_CO)
+                    add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
+                    # Cost Books
+                    for cb in sorted(cb_map.get((L, le, c), [])):
+                        id_map[("CB", L, le, c, cb)] = add_vertex(cb, S_CB, next_x, Y_CB)
+                        add_edge(id_map[("CB", L, le, c, cb)], id_map[("C", L, le, c)])
+                        # Inventory Orgs under CB
+                        for io in io_map.get((L, le, c, cb), []):
+                            io_label = f"🏭 {io['Name']}" if io["Mfg"].lower() == "yes" else io["Name"]
+                            style = S_IO_PLANT if io["Mfg"].lower() == "yes" else S_IO
+                            id_map[("IO", L, le, c, cb, io["Name"])] = add_vertex(io_label, style, next_x, Y_IO)
+                            add_edge(id_map[("IO", L, le, c, cb, io["Name"])], id_map[("C", L, le, c)])  # link to Cost Org
+            next_x += X_STEP + PAD_GROUP
+
+        return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
+
+    def _drawio_url_from_xml(xml: str) -> str:
+        raw = zlib.compress(xml.encode("utf-8"), level=9)[2:-4]
+        b64 = base64.b64encode(raw).decode("ascii")
+        return f"https://app.diagrams.net/?title=EnterpriseStructure.drawio#R{b64}"
+
+    _xml = _make_drawio_xml(df1, df2)
+
+    st.download_button(
+        "⬇️ Download diagram (.drawio)",
+        data=_xml.encode("utf-8"),
+        file_name="EnterpriseStructure.drawio",
+        mime="application/xml",
+        use_container_width=True
+    )
+    st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
