@@ -463,7 +463,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ===================== DRAW.IO DIAGRAM BLOCK (Swimlanes + Hybrid BU + Min IO Gap + Low Elbows) =====================
+# ===================== DRAW.IO DIAGRAM BLOCK (Swimlanes + Hybrid BU + Min IO Gap + Umbrella Gap + Low Elbows) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -485,7 +485,6 @@ if (
 
         # Low elbows (closer to the child row, but still between rows)
         def low_elbow(y_child, y_parent, bias=0.75):
-            # y increases downwards; parent is above child
             return int(y_parent + (y_child - y_parent) * bias)
 
         ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)   # LE -> Ledger
@@ -514,6 +513,9 @@ if (
         LEDGER_BLOCK_GAP = 120
         CLUSTER_GAP      = 360
         LEFT_PAD         = 260
+
+        # NEW: Minimum spacing between neighboring LE “umbrellas”
+        MIN_UMBRELLA_GAP = 120
 
         # ----- styles -----
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -595,10 +597,10 @@ if (
 
         for L in sorted(ledger_to_les.keys()):
             centers = []
+            prev_umbrella_max_x = None
+
             for E in sorted(ledger_to_les[L]):
-                cx = next_x
-                le_x[(L, E)] = cx
-                centers.append(cx)
+                cx = next_x  # tentative center
 
                 # Determine lane centers
                 co_center  = cx                               # CO lane = center
@@ -613,12 +615,14 @@ if (
 
                 # BUs
                 bu_list = sorted(bu_by_le.get((L, E), []))
-                for x, b in zip(centered_positions(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
+                bu_positions = centered_positions(bu_center, len(bu_list), BU_SPREAD_BASE)
+                for x, b in zip(bu_positions, bu_list):
                     bu_x[(L, E, b)] = x
 
                 # COs (+ books left, IOs under)
                 co_list = sorted(co_by_le.get((L, E), []))
-                for x, c in zip(centered_positions(co_center, len(co_list), CO_SPREAD_BASE), co_list):
+                co_positions = centered_positions(co_center, len(co_list), CO_SPREAD_BASE)
+                for x, c in zip(co_positions, co_list):
                     co_x[(L, E, c)] = x
                     # Books
                     books = sorted(cb_by_co.get((L, E, c), []))
@@ -626,25 +630,72 @@ if (
                         cb_x[(L, E, c, bk)] = x - BOOK_OFFSET_LEFT + k * spread(BOOK_SPREAD_BASE)
                     # IO under this CO
                     ios = sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])
-                    for xio, rec in zip(centered_positions(x, len(ios), IO_UNDER_CO_BASE), ios):
+                    io_positions = centered_positions(x, len(ios), IO_UNDER_CO_BASE)
+                    for xio, rec in zip(io_positions, ios):
                         io_x[(L, E, c, rec["Name"])] = (xio, rec["Mfg"])
 
                 # Direct IOs
                 dios = sorted(dio_by_le.get((L, E), []), key=lambda d: d["Name"])
-                for x, rec in zip(centered_positions(dio_center, len(dios), DIO_SPREAD_BASE), dios):
+                dio_positions = centered_positions(dio_center, len(dios), DIO_SPREAD_BASE)
+                for x, rec in zip(dio_positions, dios):
                     dio_x[(L, E, rec["Name"])] = (x, rec["Mfg"])
 
-                # advance by actual block width
+                # Tentative LE center
+                le_x[(L, E)] = cx
+
+                # Compute umbrella span for this LE
                 xs = [cx]
-                xs += [bu_x[(L, E, b)] for b in bu_list]
-                xs += [co_x[(L, E, c)] for c in co_list]
+                xs += bu_positions
+                xs += co_positions
                 xs += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
                 for c in co_list:
                     xs += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
                     xs += [io_x[(L, E, c, rec["Name"])][0] for rec in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
+
                 min_x = min(xs) - W/2
                 max_x = max(xs) + W/2
+
+                # Ensure umbrella gap vs. previous LE
+                if prev_umbrella_max_x is not None and min_x < prev_umbrella_max_x + MIN_UMBRELLA_GAP:
+                    shift = (prev_umbrella_max_x + MIN_UMBRELLA_GAP) - min_x
+                    # Shift LE center and all of its children in this ledger/LE
+                    le_x[(L, E)] = cx + shift
+                    # BU
+                    for k in list(bu_x):
+                        if k[0] == L and k[1] == E:
+                            bu_x[k] += shift
+                    # CO
+                    for k in list(co_x):
+                        if k[0] == L and k[1] == E:
+                            co_x[k] += shift
+                    # Cost Books
+                    for k in list(cb_x):
+                        if k[0] == L and k[1] == E:
+                            cb_x[k] += shift
+                    # IO under CO
+                    for k in list(io_x):
+                        if k[0] == L and k[1] == E:
+                            io_x[k] = (io_x[k][0] + shift, io_x[k][1])
+                    # Direct IOs
+                    for k in list(dio_x):
+                        if k[0] == L and k[1] == E:
+                            dio_x[k] = (dio_x[k][0] + shift, dio_x[k][1])
+
+                    # Recompute span after shift
+                    xs = [le_x[(L, E)]]
+                    xs += [bu_x[(L, E, b)] for b in bu_list]
+                    xs += [co_x[(L, E, c)] for c in co_list]
+                    xs += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
+                    for c in co_list:
+                        xs += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
+                        xs += [io_x[(L, E, c, rec["Name"])][0] for rec in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
+                    min_x = min(xs) - W/2
+                    max_x = max(xs) + W/2
+
+                # Advance placement cursors
+                prev_umbrella_max_x = max_x
                 next_x = max_x + LEDGER_BLOCK_GAP
+                centers.append(le_x[(L, E)])
 
             led_x[L] = int(sum(centers)/len(centers)) if centers else next_x
             next_x += CLUSTER_GAP
@@ -673,7 +724,6 @@ if (
             })
             g = ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
             arr = ET.SubElement(g, "Array", attrib={"as": "points"})
-            # vertical out of source to elbow, across, then up to target
             ET.SubElement(arr, "mxPoint", attrib={"x": str(int(src_center_x)), "y": str(int(elbow_y))})
             ET.SubElement(arr, "mxPoint", attrib={"x": str(int(tgt_center_x)), "y": str(int(elbow_y))})
 
@@ -757,5 +807,6 @@ if (
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
 # ===================== END DRAW.IO BLOCK =====================
+
 
 
