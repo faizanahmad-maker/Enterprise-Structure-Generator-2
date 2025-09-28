@@ -463,7 +463,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ===================== DRAW.IO DIAGRAM BLOCK (Swimlanes + Hybrid BU + Min IO Gap + Umbrella Gap + Low Elbows) =====================
+# ===================== DRAW.IO DIAGRAM BLOCK (Dynamic Direct-IO Basin) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -483,29 +483,27 @@ if (
         Y_CB     = 800
         Y_IO     = 960
 
-        # Low elbows (closer to the child row, but still between rows)
+        # Low elbows (closer to child row)
         def low_elbow(y_child, y_parent, bias=0.75):
             return int(y_parent + (y_child - y_parent) * bias)
-
-        ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)   # LE -> Ledger
-        ELBOW_BU_TO_LE  = low_elbow(Y_BU, Y_LE)       # BU -> LE
-        ELBOW_CO_TO_LE  = low_elbow(Y_CO, Y_LE)       # CO -> LE
-        ELBOW_CB_TO_CO  = low_elbow(Y_CB, Y_CO)       # Cost Book -> CO
-        ELBOW_IO_TO_CO  = low_elbow(Y_IO, Y_CO)       # IO (under CO) -> CO
-        ELBOW_DIO_TO_LE = low_elbow(Y_IO, Y_LE)       # Direct IO -> LE
+        ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)
+        ELBOW_BU_TO_LE  = low_elbow(Y_BU, Y_LE)
+        ELBOW_CO_TO_LE  = low_elbow(Y_CO, Y_LE)
+        ELBOW_CB_TO_CO  = low_elbow(Y_CB, Y_CO)
+        ELBOW_IO_TO_CO  = low_elbow(Y_IO, Y_CO)
+        ELBOW_DIO_TO_LE = low_elbow(Y_IO, Y_LE)
 
         # Lanes (relative to LE center)
-        BOOK_OFFSET_LEFT = 140        # cost books sit left of CO
-        BU_LANE_LEFT     = BOOK_OFFSET_LEFT
-        DIO_LANE_RIGHT   = BOOK_OFFSET_LEFT
+        BOOK_OFFSET_LEFT = 140               # cost books sit left of CO
+        BU_LANE_LEFT     = BOOK_OFFSET_LEFT  # BU lane aligned with book offset
 
         # Spacing inside lanes (respect min gap so boxes never touch)
         MIN_GAP = 40
         BU_SPREAD_BASE   = 190
         CO_SPREAD_BASE   = 220
-        DIO_SPREAD_BASE  = 190
         IO_UNDER_CO_BASE = 170
         BOOK_SPREAD_BASE = 160
+        DIO_SPREAD_BASE  = 190
 
         def spread(base): return max(base, W + MIN_GAP)
 
@@ -514,8 +512,11 @@ if (
         CLUSTER_GAP      = 360
         LEFT_PAD         = 260
 
-        # NEW: Minimum spacing between neighboring LE “umbrellas”
+        # Min spacing between neighboring LE “umbrellas”
         MIN_UMBRELLA_GAP = 120
+
+        # Dynamic Direct-IO basin: extra gap to the RIGHT of the CO umbrella (only if needed)
+        DIO_BASIN_GAP = 160     # horizontal breathing room between CO umbrella and Direct-IO basin
 
         # ----- styles -----
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -602,10 +603,9 @@ if (
             for E in sorted(ledger_to_les[L]):
                 cx = next_x  # tentative center
 
-                # Determine lane centers
-                co_center  = cx                               # CO lane = center
+                # Base lane centers
+                co_center  = cx                               # CO lane at center
                 bu_center  = cx - BU_LANE_LEFT                # BU lane left
-                dio_center = cx + DIO_LANE_RIGHT              # direct IO right
 
                 # Hybrid rule: if no COs & no Direct IOs, center BUs under LE
                 has_co  = len(co_by_le.get((L, E), [])) > 0
@@ -622,6 +622,7 @@ if (
                 # COs (+ books left, IOs under)
                 co_list = sorted(co_by_le.get((L, E), []))
                 co_positions = centered_positions(co_center, len(co_list), CO_SPREAD_BASE)
+                co_rightmost = cx  # will be updated
                 for x, c in zip(co_positions, co_list):
                     co_x[(L, E, c)] = x
                     # Books
@@ -633,24 +634,42 @@ if (
                     io_positions = centered_positions(x, len(ios), IO_UNDER_CO_BASE)
                     for xio, rec in zip(io_positions, ios):
                         io_x[(L, E, c, rec["Name"])] = (xio, rec["Mfg"])
+                    # update rightmost considering books and io-under-co
+                    xs_tmp = [x]
+                    xs_tmp += [cb_x[(L, E, c, bk)] for bk in books]
+                    xs_tmp += [xio for xio, _m in [io_x[(L, E, c, r["Name"])] for r in ios]]
+                    if xs_tmp:
+                        co_rightmost = max(co_rightmost, max(xs_tmp))
 
-                # Direct IOs
-                dios = sorted(dio_by_le.get((L, E), []), key=lambda d: d["Name"])
-                dio_positions = centered_positions(dio_center, len(dios), DIO_SPREAD_BASE)
-                for x, rec in zip(dio_positions, dios):
-                    dio_x[(L, E, rec["Name"])] = (x, rec["Mfg"])
+                # ---- Dynamic Direct-IO basin (only if has_dio) ----
+                dio_positions = []
+                if has_dio:
+                    dios = sorted(dio_by_le.get((L, E), []), key=lambda d: d["Name"])
+                    # Compute a dynamic center to the RIGHT of the entire CO umbrella
+                    # Basin center must be at least W/2 + DIO_BASIN_GAP to the right of the CO umbrella right edge
+                    if co_list:
+                        # include CO box width in right edge
+                        co_umbrella_right = max(co_rightmost + W/2, max(co_positions) + W/2 if co_positions else cx)
+                    else:
+                        co_umbrella_right = cx + W/2  # no COs; treat LE center as reference
+
+                    dio_center = co_umbrella_right + DIO_BASIN_GAP + W/2  # center where first DIO can sit
+                    dio_positions = centered_positions(dio_center, len(dios), DIO_SPREAD_BASE)
+                    for x, rec in zip(dio_positions, dios):
+                        dio_x[(L, E, rec["Name"])] = (x, rec["Mfg"])
 
                 # Tentative LE center
                 le_x[(L, E)] = cx
 
-                # Compute umbrella span for this LE
+                # Compute umbrella span for this LE (including dynamic DIO basin if present)
                 xs = [cx]
                 xs += bu_positions
                 xs += co_positions
-                xs += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
+                xs += [x for x, _m in [dio_x[k] for k in dio_x if k[:2] == (L, E)]]
                 for c in co_list:
                     xs += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
-                    xs += [io_x[(L, E, c, rec["Name"])][0] for rec in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
+                    if (L, E, c) in {(k[0], k[1], k[2]) for k in io_x}:
+                        xs += [io_x[(L, E, c, r["Name"])][0] for r in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
 
                 min_x = min(xs) - W/2
                 max_x = max(xs) + W/2
@@ -688,15 +707,15 @@ if (
                     xs += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
                     for c in co_list:
                         xs += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
-                        xs += [io_x[(L, E, c, rec["Name"])][0] for rec in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
+                        xs += [io_x[(L, E, c, r["Name"])][0] for r in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
                     min_x = min(xs) - W/2
                     max_x = max(xs) + W/2
 
-                # Advance placement cursors
                 prev_umbrella_max_x = max_x
                 next_x = max_x + LEDGER_BLOCK_GAP
                 centers.append(le_x[(L, E)])
 
+            # center ledger over its LEs
             led_x[L] = int(sum(centers)/len(centers)) if centers else next_x
             next_x += CLUSTER_GAP
 
@@ -762,7 +781,7 @@ if (
             id_map[("IO", L, E, c, name)] = add_vertex(label, style, x, Y_IO)
             add_edge_with_elbow(id_map[("IO", L, E, c, name)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L, E, c)]), ELBOW_IO_TO_CO)
 
-        # Direct IOs
+        # Direct IOs (dynamic basin on the right, only when present)
         for (L, E, name), (x, is_mfg) in dio_x.items():
             style = S_IO_PLT if is_mfg else S_IO
             label = f"🏭 {name}" if is_mfg else name
