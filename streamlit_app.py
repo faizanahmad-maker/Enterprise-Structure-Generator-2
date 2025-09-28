@@ -462,7 +462,7 @@ else:
         file_name="EnterpriseStructure.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-# ===================== DRAW.IO DIAGRAM BLOCK (Direct-IO edges branch right before up) =====================
+# ===================== DRAW.IO DIAGRAM BLOCK (legend fix + precise direct-IO routing) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -482,7 +482,7 @@ if (
         Y_CB     = 800
         Y_IO     = 960
 
-        # Low elbows
+        # Elbows (kept low & parallel)
         def low_elbow(y_child, y_parent, bias=0.75):
             return int(y_parent + (y_child - y_parent) * bias)
         ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)
@@ -490,9 +490,8 @@ if (
         ELBOW_CO_TO_LE  = low_elbow(Y_CO, Y_LE)
         ELBOW_CB_TO_CO  = low_elbow(Y_CB, Y_CO)
         ELBOW_IO_TO_CO  = low_elbow(Y_IO, Y_CO)
-        ELBOW_DIO_TO_LE = low_elbow(Y_IO, Y_LE)
 
-        # Lanes & spacing
+        # Lanes / spacing
         BOOK_OFFSET_LEFT = 140
         BU_LANE_LEFT     = BOOK_OFFSET_LEFT
 
@@ -509,8 +508,10 @@ if (
         CLUSTER_GAP      = 360
         LEFT_PAD         = 260
         MIN_UMBRELLA_GAP = 120
-        DIO_BASIN_GAP    = 160     # distance from CO umbrella to Direct-IO basin (when it exists)
-        MIN_DIO_BRANCH   = 120     # minimum push-out for the Direct-IO branch bus from LE center
+
+        # Direct-IO basin
+        DIO_BASIN_GAP    = 160   # distance from CO umbrella right edge to DIO basin center
+        MIN_DIO_BRANCH   = 120   # minimum push-out of the LE→DIO bus vs LE center
 
         # ----- styles -----
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -521,8 +522,10 @@ if (
         S_IO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#004080;fontSize=12;"
         S_IO_PLT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
 
+        # Ensure LE edges enter at bottom-center; IO edges exit at top-center
         S_EDGE = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
-                  "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
+                  "jettySize=auto;strokeColor=#666666;"
+                  "exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
 
         # ----- normalize -----
         df_bu = df_bu.fillna("").copy()
@@ -545,7 +548,7 @@ if (
             if L and E and B:
                 bu_by_le.setdefault((L, E), set()).add(B)
 
-        # CO/Books/IO-under-CO
+        # CO / books / IO-under-CO
         co_by_le, cb_by_co, io_by_co = {}, {}, {}
         for _, r in df2.iterrows():
             L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
@@ -626,7 +629,7 @@ if (
                     if xs_tmp:
                         co_rightmost = max(co_rightmost, max(xs_tmp))
 
-                # Dynamic Direct-IO basin (only if present)
+                # Dynamic DIO basin
                 if has_dio:
                     dios = sorted(dio_by_le.get((L, E), []), key=lambda d: d["Name"])
                     if co_list:
@@ -638,10 +641,9 @@ if (
                     for xio, rec in zip(dio_positions, dios):
                         dio_x[(L, E, rec["Name"])] = (xio, rec["Mfg"])
 
-                # record LE center
                 le_x[(L, E)] = cx
 
-                # umbrella span (for collision avoidance)
+                # umbrella span
                 xs_span = [cx] + bu_positions + co_positions
                 xs_span += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
                 for c in co_list:
@@ -708,8 +710,8 @@ if (
             ET.SubElement(arr, "mxPoint", attrib={"x": str(int(src_center_x)), "y": str(int(elbow_y))})
             ET.SubElement(arr, "mxPoint", attrib={"x": str(int(tgt_center_x)), "y": str(int(elbow_y))})
 
-        # NEW: like add_edge_with_elbow, but the second waypoint uses a **midline bus X**
-        def add_edge_with_midbus(src_id, tgt_id, src_center_x, mid_bus_x, elbow_y):
+        def add_edge_points(src_id, tgt_id, points):
+            """points = [(x1,y1), (x2,y2), ...]"""
             eid = uuid.uuid4().hex[:8]
             c = ET.SubElement(root, "mxCell", attrib={
                 "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
@@ -717,13 +719,13 @@ if (
             })
             g = ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
             arr = ET.SubElement(g, "Array", attrib={"as": "points"})
-            ET.SubElement(arr, "mxPoint", attrib={"x": str(int(src_center_x)), "y": str(int(elbow_y))})
-            ET.SubElement(arr, "mxPoint", attrib={"x": str(int(mid_bus_x)),    "y": str(int(elbow_y))})
+            for (px, py) in points:
+                ET.SubElement(arr, "mxPoint", attrib={"x": str(int(px)), "y": str(int(py))})
 
         def cx(x_left):  # left x -> center x
             return int(x_left + W/2)
 
-        # Build nodes
+        # Nodes
         id_map = {}
         for L in sorted(led_x.keys()):
             id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
@@ -750,36 +752,50 @@ if (
             id_map[("IO", L, E, c, name)] = add_vertex(label, style, x, Y_IO)
             add_edge_with_elbow(id_map[("IO", L, E, c, name)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L, E, c)]), ELBOW_IO_TO_CO)
 
-        # --- Direct IO edges with RIGHT BRANCH bus ---
-        # Compute per-LE midline bus X (between LE center and its direct-IO basin, with a minimum offset)
-        dio_bus_x = {}  # (L,E) -> x
+        # ---- Direct IO edges with bus routing aligned to BU level ----
+        # Build per-LE bus X at BU level, and a mid-depth (between BU and IO) for multi-IO fans.
+        dio_bus_x = {}     # (L,E) -> x at BU level where the right-branch bus sits
+        dio_mid_y = {}     # (L,E) -> y to create a clean vertical before reaching BU level (multi-IO)
         for (L, E), x_le in le_x.items():
             xs = [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
             if xs:
                 le_center = cx(x_le)
                 avg_dio   = sum(xs) / len(xs)
-                mid       = int((le_center + avg_dio) / 2)         # halfway between LE and DIO cluster
-                dio_bus_x[(L, E)] = max(mid, le_center + MIN_DIO_BRANCH)
+                # bus sits at least MIN_DIO_BRANCH to the right of LE center, else halfway toward the IO cluster
+                bus_x = max(int((le_center + avg_dio) / 2), le_center + MIN_DIO_BRANCH)
+                dio_bus_x[(L, E)] = bus_x
+                # mid point between BU and IO rows for cleaner rise when >1 IO
+                dio_mid_y[(L, E)] = int((Y_BU + Y_IO) / 2)
 
-        for (L, E, name), (x, is_mfg) in dio_x.items():
+        for (L, E, name), (x_io, is_mfg) in dio_x.items():
             style = S_IO_PLT if is_mfg else S_IO
             label = f"🏭 {name}" if is_mfg else name
             key = ("DIO", L, E, name)
-            id_map[key] = add_vertex(label, style, x, Y_IO)
+            id_map[key] = add_vertex(label, style, x_io, Y_IO)
 
-            # Use the per-LE branch bus X so the line runs horizontally on the right side, then up to LE
-            bus_x = dio_bus_x.get((L, E), cx(le_x[(L, E)]) + MIN_DIO_BRANCH)
-            add_edge_with_midbus(
-                id_map[key],
-                id_map[("E", L, E)],
-                cx(x),
-                bus_x,
-                ELBOW_DIO_TO_LE
-            )
+            le_center_x = cx(le_x[(L, E)])
+            bus_x = dio_bus_x.get((L, E), le_center_x + MIN_DIO_BRANCH)
 
-        # Legend (unchanged)
+            # Build the waypoint chain:
+            # 1) vertical up from IO to a mid-level (if multiple IOs) else straight to BU level
+            # 2) horizontal to the bus_x at that same y
+            # 3) horizontal to LE center at BU level
+            # 4) up into LE bottom (handled by target entry constraint)
+            # Choose first Y waypoint
+            io_count = sum(1 for k in dio_x if k[:2] == (L, E))
+            first_y = (dio_mid_y[(L, E)] if io_count >= 2 else Y_BU)
+
+            points = [
+                (cx(x_io), first_y),      # rise from IO to mid/BU level
+                (bus_x,   first_y),       # slide to the right branch
+                (le_center_x, Y_BU),      # align to LE x at BU level
+            ]
+            add_edge_points(id_map[key], id_map[("E", L, E)], points)
+
+        # ----- Legend (smaller white background) -----
         def add_legend(x=20, y=20):
-            _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 250, 184)
+            # smaller panel: width 190, height 160
+            _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 190, 160)
             items = [
                 ("Ledger", "#FFE6E6", None),
                 ("Legal Entity", "#FFE2C2", None),
@@ -793,8 +809,8 @@ if (
                 style = f"rounded=1;fillColor={col};strokeColor=#666666;"
                 if flavor == "bold":
                     style = "rounded=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;"
-                add_vertex("", style, x+12, y+28+i*22, 18, 12)
-                add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=12;", x+36, y+24+i*22, 200, 20)
+                add_vertex("", style, x+10, y+26+i*19, 16, 10)
+                add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=11;", x+32, y+22+i*19, 150, 18)
 
         add_legend()
         return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
