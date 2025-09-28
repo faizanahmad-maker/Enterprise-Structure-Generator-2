@@ -446,7 +446,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ===================== DRAW.IO DIAGRAM (LE three-prong, vertical books, spacing, centered ledgers) =====================
+# ===================== DRAW.IO DIAGRAM (CO straight down, IO no-overlap, guided trunk) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame) and
@@ -463,31 +463,31 @@ if (
         def elbow(y_child, y_parent, bias=0.75):
             return int(y_parent + (y_child - y_parent) * bias)
 
-        ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)  # LE → Ledger bus
-        ELBOW_BU_TO_LE  = elbow(Y_BU, Y_LE)      # BU elbow height
-        ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)      # CO elbow height
-        ELBOW_IO_TO_CO  = elbow(Y_IO, Y_CO)      # CO-owned IO split
-        ELBOW_CB_TO_CO  = elbow(Y_CB, Y_CO)      # Book → CO split
+        ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)
+        ELBOW_BU_TO_LE  = elbow(Y_BU, Y_LE)
+        ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)
+        ELBOW_IO_TO_CO  = elbow(Y_IO, Y_CO)
+        ELBOW_CB_TO_CO  = elbow(Y_CB, Y_CO)
 
-        # spacing / lanes
+        # spacing
         MIN_GAP = 70
         def spread(base): return max(base, W + MIN_GAP)
         BU_SPREAD_BASE, CO_SPREAD_BASE = 210, 230
-        IO_UNDER_CO_BASE = 190
+        IO_UNDER_CO_BASE = 220   # wider default fan for IOs (prevents overlap)
         LEDGER_BLOCK_GAP, CLUSTER_GAP, LEFT_PAD = 120, 420, 260
         MIN_UMBRELLA_GAP = 140
 
         # lanes relative to LE center (three-prong)
-        BU_LANE_OFFSET  = 180   # BU lane left of LE when multi-prong
-        CO_LANE_OFFSET  = 180   # CO lane right of LE
-        DIO_LANE_OFFSET = 420   # direct IO lane further right
+        BU_LANE_OFFSET  = 180    # BU lane to the left when multi-prong
+        CO_LANE_OFFSET  = 0      # <<< Cost Org stays STRAIGHT DOWN under LE
+        DIO_LANE_OFFSET = 420    # direct IO lane on the far right
 
         # cost-book column (vertical)
-        BOOK_X_OFFSET     = 220   # books at x = CO_x - BOOK_X_OFFSET
+        BOOK_X_OFFSET     = 220
         BOOK_VERTICAL_GAP = 64
 
-        # spacing enforcement between siblings
-        MIN_SPACING = 140  # <— tune if needed
+        # enforce minimum sibling spacing
+        MIN_SPACING = 180  # <<< stronger guard against overlap
 
         # ---------- Styles ----------
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -530,7 +530,7 @@ if (
         # ---------- Normalize inputs ----------
         df_bu = df_bu[["Ledger Name","Legal Entity","Business Unit"]].copy().fillna("").astype(str)
 
-        # IO tab (Tab 2) — Cost Book removed per your requirement
+        # Tab 2 (no cost books)
         LCOL = pick(df_io, ["Ledger Name","Ledger"])
         ECOL = pick(df_io, ["Legal Entity","LegalEntity"])
         COCOL= pick(df_io, ["Cost Organization","Cost Org","CostOrganization"])
@@ -540,7 +540,7 @@ if (
         df_io.rename(columns={LCOL:"Ledger Name", ECOL:"Legal Entity", COCOL:"Cost Organization",
                               IOCOL:"Inventory Org", MFGCOL:"Manufacturing Plant"}, inplace=True)
 
-        # Costing tab (Tab 3)
+        # Tab 3 (costing)
         cLCOL = pick(df_costing, ["Ledger Name","Ledger"])
         cECOL = pick(df_costing, ["Legal Entity","LegalEntity"])
         cCO   = pick(df_costing, ["Cost Organization","Cost Org","CostOrganization"])
@@ -582,13 +582,10 @@ if (
             if not (L and E and IO): continue
             rec = {"Name": IO, "Mfg": (MFG or "")}
             if C:
-                if all(x["Name"] != IO for x in io_by_co[(L,E,C)]):
-                    io_by_co[(L,E,C)].append(rec)
+                if all(x["Name"] != IO for x in io_by_co[(L,E,C)]): io_by_co[(L,E,C)].append(rec)
             else:
-                if all(x["Name"] != IO for x in dio_by_le[(L,E)]):
-                    dio_by_le[(L,E)].append(rec)
+                if all(x["Name"] != IO for x in dio_by_le[(L,E)]): dio_by_le[(L,E)].append(rec)
 
-        # Books from Costing (vertical)
         for _, r in df_costing.iterrows():
             L,E,C = r.get("Ledger Name",""), r.get("Legal Entity",""), r.get("Cost Organization","")
             bk    = r.get("Cost Book","").strip()
@@ -602,13 +599,11 @@ if (
         next_x = LEFT_PAD
         led_x, le_x, bu_x, co_x = {}, {}, {}, {}
         io_x, dio_x, cb_xy = {}, {}, {}       # CB positions are (x,y)
-        dio_lane_x = {}
 
-        # width for each CO cluster (books left + IO fan right)
         def co_cluster_halfwidth(L,E,C):
             ios = io_by_co[(L,E,C)]
-            io_half = (max(1, len(ios)) * IO_UNDER_CO_BASE)/2 + W/2   # fan to right
-            left_half = W/2 + (BOOK_X_OFFSET if cb_by_co[(L,E,C)] else 0)  # books column to left
+            io_half = (max(1, len(ios)) * IO_UNDER_CO_BASE)/2 + W/2
+            left_half = W/2 + (BOOK_X_OFFSET if cb_by_co[(L,E,C)] else 0)
             return max(left_half, io_half)
 
         prev_umbrella_max_x = None
@@ -616,31 +611,27 @@ if (
             les = sorted(le_map[L])
             le_centers = []
             for E in les:
-                # anchor LE
                 le_pos = next_x
                 le_x[(L,E)] = le_pos
                 le_centers.append(le_pos)
 
                 bu_list = sorted(set(bu_map[(L,E)]))
                 cos     = list(co_map[(L,E)])
+
                 has_bu  = bool(bu_list)
                 has_co  = bool(cos)
                 has_dio = bool(dio_by_le[(L,E)])
 
-                # three-prong lane centers
-                if has_bu and not has_co and not has_dio:
-                    bu_center = le_pos  # straight down (only BU)
-                else:
-                    bu_center = le_pos - BU_LANE_OFFSET if has_bu else le_pos
-                co_center  = le_pos + CO_LANE_OFFSET if has_co else le_pos
+                # lane centers
+                bu_center  = le_pos if (has_bu and not (has_co or has_dio)) else (le_pos - BU_LANE_OFFSET if has_bu else le_pos)
+                co_center  = le_pos  # <<< CO straight down
                 dio_center = le_pos + DIO_LANE_OFFSET if has_dio else None
-                if has_dio: dio_lane_x[(L,E)] = dio_center
 
                 # BUs
                 for x,b in zip(centers(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
                     bu_x[(L,E,b)] = x
 
-                # COs — place to the right with collision-aware spacing
+                # COs (keep first at LE_x, others spaced to right with gaps)
                 if has_co:
                     placed = []
                     cursor = co_center
@@ -657,23 +648,28 @@ if (
 
                         # IOs under this CO (centered under CO)
                         ios = sorted(io_by_co[(L,E,C)], key=lambda d: d["Name"])
-                        for xio, rec in zip(centers(xC, len(ios), IO_UNDER_CO_BASE), ios):
+                        xs = centers(xC, len(ios), IO_UNDER_CO_BASE)
+                        # enforce spacing inside this cluster too
+                        xs = enforce_spacing(xs)
+                        for xio, rec in zip(xs, ios):
                             io_x[(L,E,C,rec["Name"])] = (xio, rec["Mfg"])
 
-                        # Cost Books column (vertical, left of CO)
+                        # vertical Cost Books to the left
                         books = cb_by_co[(L,E,C)]
                         for i, bk in enumerate(sorted(books)):
                             xbk = xC - BOOK_X_OFFSET
                             ybk = Y_CB + i*BOOK_VERTICAL_GAP
                             cb_xy[(L,E,C,bk)] = (xbk, ybk)
 
-                # Direct-to-LE IOs (rightmost lane)
+                # Direct-to-LE IOs (far-right lane)
                 if has_dio:
                     dlist = sorted(dio_by_le[(L,E)], key=lambda d: d["Name"])
-                    for xio, rec in zip(centers(dio_center, len(dlist), IO_UNDER_CO_BASE), dlist):
+                    xs = centers(dio_center, len(dlist), IO_UNDER_CO_BASE)
+                    xs = enforce_spacing(xs)
+                    for xio, rec in zip(xs, dlist):
                         dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
 
-                # umbrella/overlap control between LEs
+                # umbrella guard between LEs
                 xs_span = [le_pos]
                 xs_span += [bu_x[(L,E,b)] for b in bu_list]
                 for C in cos:
@@ -688,7 +684,6 @@ if (
                 if prev_umbrella_max_x is not None and min_x < prev_umbrella_max_x + MIN_UMBRELLA_GAP:
                     shift = (prev_umbrella_max_x + MIN_UMBRELLA_GAP) - min_x
                     le_x[(L,E)] += shift
-                    # shift all child layers for this LE
                     for k in list(bu_x.keys()):
                         if k[0]==L and k[1]==E: bu_x[k] += shift
                     for k in list(co_x.keys()):
@@ -697,7 +692,6 @@ if (
                         if k[0]==L and k[1]==E: io_x[k] = (io_x[k][0] + shift, io_x[k][1])
                     for k in list(cb_xy.keys()):
                         if k[0]==L and k[1]==E: cb_xy[k] = (cb_xy[k][0] + shift, cb_xy[k][1])
-                    if (L,E) in dio_lane_x: dio_lane_x[(L,E)] += shift
                     for k in list(dio_x.keys()):
                         if k[0]==L and k[1]==E: dio_x[k] = (dio_x[k][0] + shift, dio_x[k][1])
                     max_x_ += shift
@@ -705,42 +699,14 @@ if (
                 prev_umbrella_max_x = max_x_
                 next_x = max_x_ + LEDGER_BLOCK_GAP
 
-            # provisional ledger for this cluster
+            # provisional ledger centering
             if le_centers:
                 led_x[L] = int(sum(le_x[(L,E)] for E in les) / len(les))
             else:
                 led_x[L] = next_x
             next_x += CLUSTER_GAP
 
-        # ---------- Enforce minimum spacing per LE (siblings) ----------
-        for L in ledgers_all:
-            for E in sorted(le_map.get(L, [])):
-                # BU lane
-                bu_keys = [(L,E,b) for b in bu_map.get((L,E), [])]
-                if bu_keys:
-                    xs = enforce_spacing([bu_x[k] for k in bu_keys])
-                    for k, new_x in zip(bu_keys, xs): bu_x[k] = new_x
-
-                # CO lane
-                co_keys = [(L,E,c) for c in co_map.get((L,E), [])]
-                if co_keys:
-                    xs = enforce_spacing([co_x[k] for k in co_keys])
-                    for k, new_x in zip(co_keys, xs): co_x[k] = new_x
-
-                # Direct IOs
-                dio_keys = [(L,E,r["Name"]) for r in dio_by_le.get((L,E),[])]
-                if dio_keys:
-                    xs = enforce_spacing([dio_x[k][0] for k in dio_keys])
-                    for k, new_x in zip(dio_keys, xs): dio_x[k] = (new_x, dio_x[k][1])
-
-                # IOs under each CO
-                for c in co_map.get((L,E), []):
-                    io_keys = [(L,E,c,r["Name"]) for r in io_by_co.get((L,E,c),[])]
-                    if io_keys:
-                        xs = enforce_spacing([io_x[k][0] for k in io_keys])
-                        for k, new_x in zip(io_keys, xs): io_x[k] = (new_x, io_x[k][1])
-
-        # ---------- Final re-center ledgers after all shifts ----------
+        # final re-center ledgers
         for L in ledgers_all:
             les = sorted(le_map[L])
             if les:
@@ -779,7 +745,7 @@ if (
         # Ledgers
         for L in ledgers_all:
             id_map[("L",L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
-        # LEs and edges up to ledger
+        # LEs
         for (L,E), x in le_x.items():
             id_map[("E",L,E)] = add_vertex(E, S_LE, x, Y_LE)
             add_edge_with_elbow(id_map[("E",L,E)], id_map[("L",L)], cx(x), cx(led_x[L]), ELBOW_LE_TO_LED)
@@ -787,11 +753,11 @@ if (
         for (L,E,b), x in bu_x.items():
             id_map[("B",L,E,b)] = add_vertex(b, S_BU, x, Y_BU)
             add_edge_with_elbow(id_map[("B",L,E,b)], id_map[("E",L,E)], cx(x), cx(le_x[(L,E)]), ELBOW_BU_TO_LE)
-        # COs
+        # COs (straight down)
         for (L,E,c), x in co_x.items():
             id_map[("C",L,E,c)] = add_vertex(c, S_CO, x, Y_CO)
             add_edge_with_elbow(id_map[("C",L,E,c)], id_map[("E",L,E)], cx(x), cx(le_x[(L,E)]), ELBOW_CO_TO_LE)
-        # Cost Books (vertical column at x = CO_x - BOOK_X_OFFSET)
+        # Cost Books (vertical at left of CO)
         for (L,E,c,bk), (xbk, ybk) in cb_xy.items():
             style = S_CB_P if cb_primary.get((L,E,c,bk), False) else S_CB
             id_map[("CB",L,E,c,bk)] = add_vertex(bk, style, xbk, ybk)
@@ -803,25 +769,20 @@ if (
             id_map[("IO",L,E,c,name)] = add_vertex(label, style, x, Y_IO)
             add_edge_with_elbow(id_map[("IO",L,E,c,name)], id_map[("C",L,E,c)], cx(x), cx(co_x[(L,E,c)]), ELBOW_IO_TO_CO)
 
-        # --- Direct-to-LE IOs: shared guided vertical trunk ---
+        # Direct IOs: shared guided trunk
         TRUNK_RIGHT_BIAS = 90
         dio_trunk_x = {}
         for L in ledgers_all:
             for E in sorted(le_map[L]):
                 xs = [pos[0] for (k,pos) in dio_x.items() if k[0]==L and k[1]==E]
-                if xs:
-                    dio_trunk_x[(L,E)] = int(sum(xs)/len(xs)) + TRUNK_RIGHT_BIAS
-                else:
-                    dio_trunk_x[(L,E)] = cx(le_x[(L,E)]) + TRUNK_RIGHT_BIAS
+                dio_trunk_x[(L,E)] = (int(sum(xs)/len(xs)) if xs else cx(le_x[(L,E)])) + TRUNK_RIGHT_BIAS
 
         for (L,E,name), (x, is_mfg) in dio_x.items():
             style = S_IO_PLT if str(is_mfg).lower() in ("yes","y","true","1") else S_IO
             label = f"🏭 {name}" if style == S_IO_PLT else name
             v = add_vertex(label, style, x, Y_IO)
-
             le_center_x = cx(le_x[(L,E)])
-            trunk_x = dio_trunk_x.get((L,E), max(le_center_x, x) + TRUNK_RIGHT_BIAS)
-
+            trunk_x = dio_trunk_x[(L,E)]
             add_edge_points(
                 v, id_map[("E",L,E)],
                 [(trunk_x, ELBOW_IO_TO_CO),
@@ -829,7 +790,7 @@ if (
                  (le_center_x, ELBOW_BU_TO_LE)]
             )
 
-        # Legend (top-left)
+        # Legend
         def add_legend(x=12, y=12):
             _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 180, 176)
             items = [
