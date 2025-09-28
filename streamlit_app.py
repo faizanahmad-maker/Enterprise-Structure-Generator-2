@@ -346,7 +346,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # ===================== DRAW.IO DIAGRAM BLOCK (Cost Books + Inventory Orgs) =====================
+  # ===================== DRAW.IO DIAGRAM BLOCK (Cost Books + Inventory Orgs, spaced) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -358,6 +358,7 @@ if (
         # --- layout & spacing ---
         W, H       = 180, 48
         X_STEP     = 230
+        IO_STEP    = max(110, X_STEP // 2)   # tighter horizontal spacing for IOs
         PAD_GROUP  = 60
         LEFT_PAD   = 260
         RIGHT_PAD  = 200
@@ -367,7 +368,7 @@ if (
         Y_BU       = 470
         Y_CO       = 630
         Y_CB       = 790
-        Y_IO       = 950  # NEW: Inventory Orgs under Cost Books
+        Y_IO       = 950   # IOs one tier below Cost Books
 
         # --- styles ---
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -395,7 +396,7 @@ if (
 
         ledgers_all = sorted([x for x in set(df_bu["Ledger Name"]) | set(df_co_books["Ledger Name"]) if x])
 
-        # maps
+        # --- maps (base) ---
         le_map, bu_map, co_map, cb_map, io_map = {}, {}, {}, {}, {}
 
         for _, r in pd.concat([df_bu[["Ledger Name","Legal Entity"]],
@@ -415,12 +416,94 @@ if (
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"]:
                 cb_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]), set()).add(r["Cost Book"])
 
+        # IOs keyed by (L, LE, CO, CB) — only when a Cost Book is present (so they sit under CB visually)
         for _, r in df_co_books.iterrows():
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"] and r["Inventory Org"]:
-                io_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"], r["Cost Book"]), []).append({
+                io_map.setdefault(
+                    (r["Ledger Name"], r["Legal Entity"], r["Cost Organization"], r["Cost Book"]),
+                    []
+                ).append({
                     "Name": r["Inventory Org"],
-                    "Mfg": str(r.get("Manufacturing Plant", "")).strip()
+                    "Mfg": (r.get("Manufacturing Plant", "") or "").strip()
                 })
+
+        # --- parking lots (unchanged from your base) ---
+        orphan_ledgers = sorted([L for L in ledgers_all if not le_map.get(L)])
+        unassigned_les = sorted(
+            set(df_bu.loc[(df_bu["Ledger Name"] == "") & (df_bu["Legal Entity"] != ""), "Legal Entity"].unique()) |
+            set(df_co_books.loc[(df_co_books["Ledger Name"] == "") & (df_co_books["Legal Entity"] != ""), "Legal Entity"].unique())
+        )
+        all_bus = set(df_bu.loc[df_bu["Business Unit"] != "", "Business Unit"].unique())
+        assigned_bus = set(
+            df_bu.loc[
+                (df_bu["Ledger Name"] != "") & (df_bu["Legal Entity"] != "") & (df_bu["Business Unit"] != ""),
+                "Business Unit"
+            ].unique()
+        )
+        unassigned_bus = sorted(all_bus - assigned_bus)
+
+        # --- x-coordinates (extend your base with IO layer) ---
+        next_x = LEFT_PAD
+        led_x, le_x, bu_x, co_x, cb_x, io_x = {}, {}, {}, {}, {}, {}
+
+        for L in ledgers_all:
+            if L in orphan_ledgers: 
+                continue
+            les = sorted(le_map.get(L, []))
+            for le in les:
+                buses = sorted(bu_map.get((L, le), []))
+                cos   = sorted(co_map.get((L, le), []))
+                all_children = (buses + cos) if (buses or cos) else [le]
+
+                # allocate sibling columns for BUs and COs (your base behavior)
+                for child in all_children:
+                    if (child in buses) and (child not in bu_x):
+                        bu_x[child] = next_x; next_x += X_STEP
+                    elif (child in cos) and (child not in co_x):
+                        co_x[child] = next_x; next_x += X_STEP
+
+                # center LE over its children
+                if buses or cos:
+                    xs = []
+                    if buses: xs += [bu_x[b] for b in buses]
+                    if cos:   xs += [co_x[c] for c in cos]
+                    le_x[(L, le)] = int(sum(xs)/len(xs))
+                else:
+                    le_x[(L, le)] = next_x; next_x += X_STEP
+
+                # allocate books under each CO (your base)
+                for c in cos:
+                    books = sorted(cb_map.get((L, le, c), []))
+                    if books:
+                        base_x = co_x[c]
+                        start_x = base_x - (len(books)-1) * (X_STEP//2)
+                        for i, bk in enumerate(books):
+                            cb_x[(L, le, c, bk)] = start_x + i*(X_STEP)
+
+                            # NEW: allocate IOs under this book, centered on cb_x
+                            io_list = io_map.get((L, le, c, bk), [])
+                            if io_list:
+                                io_start = cb_x[(L, le, c, bk)] - (len(io_list)-1) * (IO_STEP//2)
+                                for j, io in enumerate(io_list):
+                                    key = (L, le, c, bk, io["Name"])
+                                    io_x[key] = io_start + j * IO_STEP
+
+            if les:
+                xs = [le_x[(L, le)] for le in les]
+                led_x[L] = int(sum(xs)/len(xs))
+            next_x += PAD_GROUP
+
+        # right-side parking (unchanged)
+        next_x += RIGHT_PAD
+        for e in unassigned_les:
+            le_x[("UNASSIGNED", e)] = next_x; next_x += X_STEP
+        next_x += PAD_GROUP
+        for b in unassigned_bus:
+            if b not in bu_x:
+                bu_x[b] = next_x; next_x += X_STEP
+        next_x += PAD_GROUP
+        for L in orphan_ledgers:
+            led_x[("ORPHAN", L)] = next_x; next_x += X_STEP
 
         # --- XML skeleton ---
         mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
@@ -449,40 +532,67 @@ if (
                 "source": src, "target": tgt})
             ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
 
-        # --- build nodes ---
-        id_map = {}
-        next_x = LEFT_PAD
+        def add_text(text, x, y):
+            tid = uuid.uuid4().hex[:8]
+            t = ET.SubElement(root, "mxCell", attrib={
+                "id": tid, "value": text, "style": S_HDR, "vertex": "1", "parent": "1"})
+            ET.SubElement(t, "mxGeometry", attrib={
+                "x": str(int(x)), "y": str(int(y)), "width": "260", "height": "22", "as": "geometry"})
+            return tid
 
+        # --- vertices ---
+        id_map = {}
         for L in ledgers_all:
-            id_map[("L", L)] = add_vertex(L, S_LEDGER, next_x, Y_LEDGER)
+            if L in orphan_ledgers: 
+                continue
+            id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
+
             for le in sorted(le_map.get(L, [])):
-                id_map[("E", L, le)] = add_vertex(le, S_LE, next_x, Y_LE)
-                add_edge(id_map[("E", L, le)], id_map[("L", L)])
+                id_map[("E", L, le)] = add_vertex(le, S_LE, le_x[(L, le)], Y_LE)
                 for b in sorted(bu_map.get((L, le), [])):
-                    id_map[("B", L, le, b)] = add_vertex(b, S_BU, next_x, Y_BU)
-                    add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
+                    id_map[("B", L, le, b)] = add_vertex(b, S_BU, bu_x[b], Y_BU)
                 for c in sorted(co_map.get((L, le), [])):
-                    id_map[("C", L, le, c)] = add_vertex(c, S_CO, next_x, Y_CO)
-                    add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
-                    for cb in sorted(cb_map.get((L, le, c), [])):
-                        id_map[("CB", L, le, c, cb)] = add_vertex(cb, S_CB, next_x, Y_CB)
-                        add_edge(id_map[("CB", L, le, c, cb)], id_map[("C", L, le, c)])
-                        for io in io_map.get((L, le, c, cb), []):
+                    id_map[("C", L, le, c)] = add_vertex(c, S_CO, co_x[c], Y_CO)
+                    for bk in sorted(cb_map.get((L, le, c), [])):
+                        id_map[("CB", L, le, c, bk)] = add_vertex(bk, S_CB, cb_x.get((L, le, c, bk), co_x[c]), Y_CB)
+                        # IOs below this Cost Book (spaced horizontally)
+                        for io in io_map.get((L, le, c, bk), []):
                             io_label = f"🏭 {io['Name']}" if io["Mfg"].lower() == "yes" else io["Name"]
                             style = S_IO_PLANT if io["Mfg"].lower() == "yes" else S_IO
-                            id_map[("IO", L, le, c, cb, io["Name"])] = add_vertex(io_label, style, next_x, Y_IO)
-                            add_edge(id_map[("IO", L, le, c, cb, io["Name"])], id_map[("C", L, le, c)])
-            next_x += X_STEP + PAD_GROUP
+                            key = (L, le, c, bk, io["Name"])
+                            x_pos = io_x.get(key, cb_x.get((L, le, c, bk), co_x[c]))
+                            id_map[("IO",) + key] = add_vertex(io_label, style, x_pos, Y_IO)
 
-        # --- legend ---
+        # --- edges (child → parent, as in your base) ---
+        for L in ledgers_all:
+            if L in orphan_ledgers: 
+                continue
+            for le in sorted(le_map.get(L, [])):
+                if ("E", L, le) in id_map and ("L", L) in id_map:
+                    add_edge(id_map[("E", L, le)], id_map[("L", L)])
+                for b in sorted(bu_map.get((L, le), [])):
+                    if ("B", L, le, b) in id_map:
+                        add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
+                for c in sorted(co_map.get((L, le), [])):
+                    if ("C", L, le, c) in id_map:
+                        add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
+                        for bk in sorted(cb_map.get((L, le, c), [])):
+                            if ("CB", L, le, c, bk) in id_map:
+                                add_edge(id_map[("CB", L, le, c, bk)], id_map[("C", L, le, c)])
+                                # IOs link to Cost Org (not to Cost Book)
+                                for io in io_map.get((L, le, c, bk), []):
+                                    k = ("IO", L, le, c, bk, io["Name"])
+                                    if k in id_map:
+                                        add_edge(id_map[k], id_map[("C", L, le, c)])
+
+        # --- legend (extended) ---
         def add_legend(x=20, y=20):
             def swatch(lbl, color, offset, stroke="#666666", bold=False):
                 style = f"rounded=1;fillColor={color};strokeColor={stroke};"
                 if bold: style += "strokeWidth=2;"
                 box = ET.SubElement(root, "mxCell", attrib={
                     "id": uuid.uuid4().hex[:8], "value": "",
-                    "style": style,
-                    "vertex": "1", "parent": "1"})
+                    "style": style, "vertex": "1", "parent": "1"})
                 ET.SubElement(box, "mxGeometry", attrib={
                     "x": str(x+12), "y": str(y+offset), "width": "18", "height": "12", "as": "geometry"})
                 txt = ET.SubElement(root, "mxCell", attrib={
@@ -490,7 +600,7 @@ if (
                     "style": "text;align=left;verticalAlign=middle;fontSize=12;",
                     "vertex": "1", "parent": "1"})
                 ET.SubElement(txt, "mxGeometry", attrib={
-                    "x": str(x+36), "y": str(y+offset-4), "width": "170", "height": "20", "as": "geometry"})
+                    "x": str(x+36), "y": str(y+offset-4), "width": "190", "height": "20", "as": "geometry"})
 
             swatch("Ledger", "#FFE6E6", 36)
             swatch("Legal Entity", "#FFE2C2", 62)
@@ -501,7 +611,6 @@ if (
             swatch("Manufacturing Plant (IO)", "#D6EFFF", 192, stroke="#1F4D7A", bold=True)
 
         add_legend()
-
         return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
 
     def _drawio_url_from_xml(xml: str) -> str:
@@ -519,4 +628,5 @@ if (
         use_container_width=True
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
+
 
