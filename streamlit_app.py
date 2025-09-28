@@ -478,13 +478,16 @@ if (
         MIN_UMBRELLA_GAP = 140
 
         # lanes relative to LE center (three-prong)
-        BU_LANE_OFFSET  = 180   # BU lane center is LE_x - offset (when multi-prong)
-        CO_LANE_OFFSET  = 180   # CO lane center is LE_x + offset
+        BU_LANE_OFFSET  = 180   # BU lane left of LE when multi-prong
+        CO_LANE_OFFSET  = 180   # CO lane right of LE
         DIO_LANE_OFFSET = 420   # direct IO lane further right
 
         # cost-book column (vertical)
         BOOK_X_OFFSET     = 220   # books at x = CO_x - BOOK_X_OFFSET
         BOOK_VERTICAL_GAP = 64
+
+        # spacing enforcement between siblings
+        MIN_SPACING = 140  # <— tune if needed
 
         # ---------- Styles ----------
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -516,10 +519,18 @@ if (
             start = center_x - (s*(n-1))/2.0
             return [int(start + i*s) for i in range(n)]
 
+        def enforce_spacing(xs):
+            if not xs: return xs
+            xs_sorted = sorted(xs)
+            for i in range(1, len(xs_sorted)):
+                if xs_sorted[i] - xs_sorted[i-1] < MIN_SPACING:
+                    xs_sorted[i] = xs_sorted[i-1] + MIN_SPACING
+            return xs_sorted
+
         # ---------- Normalize inputs ----------
         df_bu = df_bu[["Ledger Name","Legal Entity","Business Unit"]].copy().fillna("").astype(str)
 
-        # IO tab (Tab 2) — you removed Cost Book from Tab 2, so we don't read it here
+        # IO tab (Tab 2) — Cost Book removed per your requirement
         LCOL = pick(df_io, ["Ledger Name","Ledger"])
         ECOL = pick(df_io, ["Legal Entity","LegalEntity"])
         COCOL= pick(df_io, ["Cost Organization","Cost Org","CostOrganization"])
@@ -577,7 +588,7 @@ if (
                 if all(x["Name"] != IO for x in dio_by_le[(L,E)]):
                     dio_by_le[(L,E)].append(rec)
 
-        # Books from Costing tab (preferred; vertical column)
+        # Books from Costing (vertical)
         for _, r in df_costing.iterrows():
             L,E,C = r.get("Ledger Name",""), r.get("Legal Entity",""), r.get("Cost Organization","")
             bk    = r.get("Cost Book","").strip()
@@ -591,9 +602,9 @@ if (
         next_x = LEFT_PAD
         led_x, le_x, bu_x, co_x = {}, {}, {}, {}
         io_x, dio_x, cb_xy = {}, {}, {}       # CB positions are (x,y)
-        dio_lane_x = {}                        # (L,E) -> x center for direct IOs
+        dio_lane_x = {}
 
-        # determine per-CO cluster half-width (vertical books left + IO fan right)
+        # width for each CO cluster (books left + IO fan right)
         def co_cluster_halfwidth(L,E,C):
             ios = io_by_co[(L,E,C)]
             io_half = (max(1, len(ios)) * IO_UNDER_CO_BASE)/2 + W/2   # fan to right
@@ -639,7 +650,7 @@ if (
                             xC = cursor
                         else:
                             prev = placed[-1]
-                            need = (prev["half"] + half + MIN_GAP)  # buffer between clusters
+                            need = (prev["half"] + half + MIN_GAP)
                             xC = int(prev["x"] + need)
                         placed.append({"C":C, "x":xC, "half":half})
                         co_x[(L,E,C)] = xC
@@ -683,28 +694,53 @@ if (
                     for k in list(co_x.keys()):
                         if k[0]==L and k[1]==E: co_x[k] += shift
                     for k in list(io_x.keys()):
-                        if k[0]==L and k[1]==E:
-                            io_x[k] = (io_x[k][0] + shift, io_x[k][1])
+                        if k[0]==L and k[1]==E: io_x[k] = (io_x[k][0] + shift, io_x[k][1])
                     for k in list(cb_xy.keys()):
-                        if k[0]==L and k[1]==E:
-                            cb_xy[k] = (cb_xy[k][0] + shift, cb_xy[k][1])
+                        if k[0]==L and k[1]==E: cb_xy[k] = (cb_xy[k][0] + shift, cb_xy[k][1])
                     if (L,E) in dio_lane_x: dio_lane_x[(L,E)] += shift
                     for k in list(dio_x.keys()):
-                        if k[0]==L and k[1]==E:
-                            dio_x[k] = (dio_x[k][0] + shift, dio_x[k][1])
+                        if k[0]==L and k[1]==E: dio_x[k] = (dio_x[k][0] + shift, dio_x[k][1])
                     max_x_ += shift
 
                 prev_umbrella_max_x = max_x_
                 next_x = max_x_ + LEDGER_BLOCK_GAP
 
-            # provisional ledgers for this cluster
+            # provisional ledger for this cluster
             if le_centers:
                 led_x[L] = int(sum(le_x[(L,E)] for E in les) / len(les))
             else:
                 led_x[L] = next_x
             next_x += CLUSTER_GAP
 
-        # final re-center ledgers after all shifts
+        # ---------- Enforce minimum spacing per LE (siblings) ----------
+        for L in ledgers_all:
+            for E in sorted(le_map.get(L, [])):
+                # BU lane
+                bu_keys = [(L,E,b) for b in bu_map.get((L,E), [])]
+                if bu_keys:
+                    xs = enforce_spacing([bu_x[k] for k in bu_keys])
+                    for k, new_x in zip(bu_keys, xs): bu_x[k] = new_x
+
+                # CO lane
+                co_keys = [(L,E,c) for c in co_map.get((L,E), [])]
+                if co_keys:
+                    xs = enforce_spacing([co_x[k] for k in co_keys])
+                    for k, new_x in zip(co_keys, xs): co_x[k] = new_x
+
+                # Direct IOs
+                dio_keys = [(L,E,r["Name"]) for r in dio_by_le.get((L,E),[])]
+                if dio_keys:
+                    xs = enforce_spacing([dio_x[k][0] for k in dio_keys])
+                    for k, new_x in zip(dio_keys, xs): dio_x[k] = (new_x, dio_x[k][1])
+
+                # IOs under each CO
+                for c in co_map.get((L,E), []):
+                    io_keys = [(L,E,c,r["Name"]) for r in io_by_co.get((L,E,c),[])]
+                    if io_keys:
+                        xs = enforce_spacing([io_x[k][0] for k in io_keys])
+                        for k, new_x in zip(io_keys, xs): io_x[k] = (new_x, io_x[k][1])
+
+        # ---------- Final re-center ledgers after all shifts ----------
         for L in ledgers_all:
             les = sorted(le_map[L])
             if les:
@@ -767,9 +803,8 @@ if (
             id_map[("IO",L,E,c,name)] = add_vertex(label, style, x, Y_IO)
             add_edge_with_elbow(id_map[("IO",L,E,c,name)], id_map[("C",L,E,c)], cx(x), cx(co_x[(L,E,c)]), ELBOW_IO_TO_CO)
 
-        # --- Direct-to-LE IOs: restore shared vertical trunk routing (guided path) ---
+        # --- Direct-to-LE IOs: shared guided vertical trunk ---
         TRUNK_RIGHT_BIAS = 90
-        # Compute trunk X per (Ledger, LE)
         dio_trunk_x = {}
         for L in ledgers_all:
             for E in sorted(le_map[L]):
@@ -787,7 +822,6 @@ if (
             le_center_x = cx(le_x[(L,E)])
             trunk_x = dio_trunk_x.get((L,E), max(le_center_x, x) + TRUNK_RIGHT_BIAS)
 
-            # Waypoints: up to CO-IO elbow, then BU elbow, then across to LE center
             add_edge_points(
                 v, id_map[("E",L,E)],
                 [(trunk_x, ELBOW_IO_TO_CO),
