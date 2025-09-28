@@ -321,21 +321,45 @@ else:
     df2.insert(0, "Assignment", range(1, len(df2) + 1))
 
     # ------------ Excel Output ------------
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        df1.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
-        df2.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_IOs")
+    def _blankify(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cleans NaN values:
+      1. Replace real NaN/None with blanks.
+      2. Replace literal 'nan'/'NaN' strings (from earlier str() calls).
+      3. Strip whitespace from strings.
+    """
+    df = df.fillna("")
+    df = df.replace({r"^\s*(?i)nan\s*$": ""}, regex=True)
+    for c in df.columns:
+        if pd.api.types.is_string_dtype(df[c]):
+            df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+    return df
 
-    st.success(f"Built {len(df1)} BU rows and {len(df2)} Inventory Org rows.")
-    st.dataframe(df1.head(25), use_container_width=True, height=280)
-    st.dataframe(df2.head(25), use_container_width=True, height=320)
+# Apply cleaning to both sheets
+df1_clean = _blankify(df1)
+df2_clean = _blankify(df2)
 
-    st.download_button(
-        "⬇️ Download Excel (EnterpriseStructure.xlsx)",
-        data=excel_buf.getvalue(),
-        file_name="EnterpriseStructure.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+# Create Excel file in memory
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    df1_clean.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
+    df2_clean.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_Books")
+
+# Success message
+st.success(f"Built {len(df1_clean)} BU rows and {len(df2_clean)} Inventory Org rows.")
+
+# Preview top rows
+st.dataframe(df1_clean.head(25), use_container_width=True, height=280)
+st.dataframe(df2_clean.head(25), use_container_width=True, height=280)
+
+# Download button
+st.download_button(
+    "⬇️ Download Excel (EnterpriseStructure.xlsx)",
+    data=excel_buf.getvalue(),
+    file_name="EnterpriseStructure.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
 
  # ===================== DRAW.IO DIAGRAM BLOCK (IO min-gap + ledger group padding) =====================
 if (
