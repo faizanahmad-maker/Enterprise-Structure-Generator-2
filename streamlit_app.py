@@ -3,19 +3,18 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Enterprise Structure Generator", page_icon="📊", layout="wide")
-st.title("Enterprise Structure Generator — Excel (3 tabs, strict BU mapping)")
+st.title("Enterprise Structure Generator — Excel (BU LE name from FUN)")
 
 st.markdown("""
 Upload up to **9 Oracle export ZIPs** (any order):
-- `Manage General Ledger` → **GL_PRIMARY_LEDGER.csv**
-- `Manage Legal Entities` → **XLE_ENTITY_PROFILE.csv**
-- `Assign Legal Entities` → **ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv**
-- *(optional debug)* Journal config detail → **ORA_GL_JOURNAL_CONFIG_DETAIL.csv** *(names are **not** used)*
-- `Manage Business Units` → **FUN_BUSINESS_UNIT.csv**
-- `Manage Cost Organizations` → **CST_COST_ORGANIZATION.csv**
-- `Manage Cost Organization Relationships` → **CST_COST_ORG_BOOK.csv**
-- `Manage Inventory Organizations` → **INV_ORGANIZATION_PARAMETER.csv**
-- `Cost Org ↔ Inventory Org relationships` → **ORA_CST_COST_ORG_INV.csv**
+- `Manage Primary Ledgers` → **GL_PRIMARY_LEDGER.csv** (ORA_GL_PRIMARY_LEDGER_CONFIG.Name)
+- `Manage Legal Entities` → **XLE_ENTITY_PROFILE.csv** (LegalEntityIdentifier, Name)
+- `Assign Legal Entities` → **ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv** (GL_LEDGER.Name, LegalEntityIdentifier)
+- `Manage Business Units` → **FUN_BUSINESS_UNIT.csv** (Name, PrimaryLedgerName, LegalEntityName, LegalEntityIdentifier?)
+- `Manage Cost Organizations` → **CST_COST_ORGANIZATION.csv** (Name, LegalEntityIdentifier, OrgInformation2)
+- `Manage Cost Org Relationships` → **CST_COST_ORG_BOOK.csv** (CostOrgCode, CostBookCode, PrimaryFlag)
+- `Manage Inventory Orgs` → **INV_ORGANIZATION_PARAMETER.csv** (OrganizationCode, Name, LegalEntityIdentifier?, BusinessUnitName, ProfitCenterBuName, MfgPlantFlag)
+- `Cost Org ↔ Inv Org` → **ORA_CST_COST_ORG_INV.csv** (OrganizationCode, CostOrgCode)
 """)
 
 uploads = st.file_uploader("Drop your ZIPs here", type="zip", accept_multiple_files=True)
@@ -63,23 +62,21 @@ else:
     # ------------ Collectors ------------
     ledger_names = set()
 
-    # Canonical LE mappings (STRICTLY from XLE)
-    ident_to_le_name = {}            # LE identifier -> LE name
-    xle_identifiers  = set()         # all LE identifiers present in XLE
+    # XLE: canonical identifiers + names (for lookups only)
+    ident_to_le_name = {}
+    name_to_idents = {}
 
-    ledger_to_idents = {}            # ledger -> {LE identifier}
+    # Ledger ↔ LE identifiers
+    ledger_to_idents = {}
 
-    bu_rows = []                     # Business Units (store LEIdent ONLY if present in BU file)
+    # Business Units (we will take LE NAME from FUN_BUSINESS_UNIT)
+    bu_rows = []   # {Name, PrimaryLedgerName, BU_LE_Name, BU_LE_Ident?}
 
-    # Cost Orgs
-    costorg_rows = []                # [{Name, LegalEntityIdentifier, JoinKey}]
-
-    # Cost Books (with primary flag)  joinkey -> list[(book_code, is_primary)]
+    # Costing + Inv Org
+    costorg_rows = []
     books_by_joinkey = {}
-
-    # Inventory Orgs
-    invorg_rows = []                 # [{Code, Name, LEIdent, BUName, PCBU, Mfg}]
-    invorg_rel = {}                  # InvOrgCode -> CostOrgJoinKey
+    invorg_rows = []
+    invorg_rel = {}
 
     # ------------ Load zips ------------
     loaded_zips = []
@@ -96,25 +93,20 @@ else:
             col = pick_col(df, ["ORA_GL_PRIMARY_LEDGER_CONFIG.Name"])
             if col:
                 ledger_names |= set(df[col].dropna().map(str).str.strip())
-            else:
-                st.warning("`GL_PRIMARY_LEDGER.csv` missing `ORA_GL_PRIMARY_LEDGER_CONFIG.Name`.")
 
-    # Legal Entities (STRICT source of truth for names)
+    # XLE (identifier + name)
     for z in loaded_zips:
         df = read_csv_from_zip(z, "XLE_ENTITY_PROFILE.csv")
         if df is not None:
-            name_col  = pick_col(df, ["NAME", "Name"])
             ident_col = pick_col(df, ["LEGAL_ENTITY_IDENTIFIER", "LegalEntityIdentifier"])
-            if name_col and ident_col:
+            name_col  = pick_col(df, ["NAME", "Name"])
+            if ident_col and name_col:
                 for _, r in df[[ident_col, name_col]].dropna(how="all").iterrows():
                     ident = str(r[ident_col]).strip()
                     name  = str(r[name_col]).strip()
-                    if ident:
-                        xle_identifiers.add(ident)
-                        if name:
-                            ident_to_le_name.setdefault(ident, name)
-            else:
-                st.error("`XLE_ENTITY_PROFILE.csv` must include both identifier and name columns.")
+                    if ident and name:
+                        ident_to_le_name.setdefault(ident, name)
+                        name_to_idents.setdefault(_norm_key(name), set()).add(ident)
 
     # Ledger ↔ LE identifier
     for z in loaded_zips:
@@ -128,25 +120,23 @@ else:
                     ident = str(r[ident_col]).strip()
                     if led and ident:
                         ledger_to_idents.setdefault(led, set()).add(ident)
-            else:
-                st.warning("`ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv` missing needed columns.")
 
-    # Business Units — STRICT: do not infer; accept identifier only if present in BU file
+    # FUN: Business Units (LE NAME is authoritative here)
     for z in loaded_zips:
         df = read_csv_from_zip(z, "FUN_BUSINESS_UNIT.csv")
         if df is not None:
             bu_col   = pick_col(df, ["Name"])
             led_col  = pick_col(df, ["PrimaryLedgerName"])
-            le_ident_col = pick_col(df, ["LegalEntityIdentifier"])
-            if bu_col and led_col:
+            le_name_col  = pick_col(df, ["LegalEntityName"])
+            le_ident_col = pick_col(df, ["LegalEntityIdentifier"])  # often blank
+            if bu_col and led_col and le_name_col:
                 for _, r in df.dropna(how="all").iterrows():
                     bu_rows.append({
                         "Name": str(r.get(bu_col, "")).strip(),
                         "PrimaryLedgerName": str(r.get(led_col, "")).strip(),
-                        "LEIdent": str(r.get(le_ident_col, "")).strip() if le_ident_col else ""
+                        "BU_LE_Name": str(r.get(le_name_col, "")).strip(),
+                        "BU_LE_Ident": str(r.get(le_ident_col, "")).strip() if le_ident_col else ""
                     })
-            else:
-                st.warning("`FUN_BUSINESS_UNIT.csv` missing needed columns (Name, PrimaryLedgerName).")
 
     # Cost Orgs
     for z in loaded_zips:
@@ -162,8 +152,6 @@ else:
                         "LegalEntityIdentifier": str(r[ident_col]).strip(),
                         "JoinKey": str(r[join_col]).strip()
                     })
-            else:
-                st.warning("`CST_COST_ORGANIZATION.csv` missing (Name, LegalEntityIdentifier, OrgInformation2).")
 
     # Cost Books
     for z in loaded_zips:
@@ -180,8 +168,6 @@ else:
                     is_primary = rawp in {"Y","YES","1","TRUE"}
                     if joink and book:
                         books_by_joinkey.setdefault(joink, []).append((book, is_primary))
-            else:
-                st.warning("`CST_COST_ORG_BOOK.csv` missing (CostOrgCode, CostBookCode).")
 
     # Inventory Orgs
     for z in loaded_zips:
@@ -203,8 +189,6 @@ else:
                         "PCBU": str(r.get(pcbu_col, "")).strip(),
                         "Mfg": "Yes" if str(r.get(mfg_col, "")).strip().upper() == "Y" else ""
                     })
-            else:
-                st.warning("`INV_ORGANIZATION_PARAMETER.csv` missing needed columns.")
 
     # Cost Org ↔ Inv Org
     for z in loaded_zips:
@@ -215,8 +199,6 @@ else:
             if inv_col and co_col:
                 for _, r in df[[inv_col, co_col]].dropna(how="all").iterrows():
                     invorg_rel[str(r[inv_col]).strip()] = str(r[co_col]).strip()
-            else:
-                st.warning("`ORA_CST_COST_ORG_INV.csv` missing (OrganizationCode, CostOrgCode).")
 
     # ------------ Derived maps ------------
     ident_to_ledgers = {}
@@ -225,35 +207,41 @@ else:
             ident_to_ledgers.setdefault(ident, set()).add(led)
 
     # ===================================================
-    # Tab 1: Core Enterprise Structure (identifier-aware, no BU inference)
+    # Tab 1: Core Enterprise Structure
     # ===================================================
     rows1 = []
-    seen_pairs = set()           # (ledger, le_ident)
-    seen_ledgers_with_bu = set()
-    seen_le_idents_with_bu = set()
+    seen_pairs = set()           # (ledger, le_ident or bu_name marker)
 
-    # BU-driven rows (use identifier only if present in BU file)
+    # 1) BU-driven rows — LE NAME **from FUN**
     for r in bu_rows:
-        bu   = str(r.get("Name", "")).strip()
-        led  = str(r.get("PrimaryLedgerName", "")).strip()
-        leid = str(r.get("LEIdent", "")).strip()
+        bu   = r["Name"]
+        led  = r["PrimaryLedgerName"]
+        bu_le_name  = r["BU_LE_Name"]
+        bu_le_ident = r["BU_LE_Ident"]  # may be blank
 
-        le_name = ident_to_le_name.get(leid, "") if leid else ""
+        # If BU provided identifier AND it uniquely maps to an XLE name, use that name too
+        if bu_le_ident and bu_le_ident in ident_to_le_name:
+            le_name_out = ident_to_le_name[bu_le_ident]
+            le_ident_out = bu_le_ident
+        else:
+            # Name is authoritative for BU; identifier only if the name uniquely exists in XLE
+            le_name_out = bu_le_name
+            id_candidates = list(name_to_idents.get(_norm_key(bu_le_name), []))
+            le_ident_out = id_candidates[0] if len(id_candidates) == 1 else ""
+
         rows1.append({
             "Ledger Name": led,
-            "Legal Entity Identifier": leid,
-            "Legal Entity": le_name,
+            "Legal Entity Identifier": le_ident_out,
+            "Legal Entity": le_name_out,
             "Business Unit": bu
         })
+        seen_pairs.add((led, le_ident_out, bu))  # include BU to avoid collapsing BUs that share same LE
 
-        if led: seen_ledgers_with_bu.add(led)
-        if leid: seen_le_idents_with_bu.add(leid)
-        if led and leid: seen_pairs.add((led, leid))
-
-    # Ledger–LE pairs without BU
+    # 2) Ledger–LE pairs without BU (identifier → name from XLE)
     for led, idents in ledger_to_idents.items():
         for ident in idents:
-            if (led, ident) not in seen_pairs:
+            key = (led, ident, "")
+            if key not in seen_pairs:
                 rows1.append({
                     "Ledger Name": led,
                     "Legal Entity Identifier": ident,
@@ -261,9 +249,10 @@ else:
                     "Business Unit": ""
                 })
 
-    # Orphan ledgers (no LE mapping, no BU)
+    # 3) Orphan ledgers (no mapping, no BU)
     mapped_ledgers = set(ledger_to_idents.keys())
-    for led in sorted(ledger_names - mapped_ledgers - seen_ledgers_with_bu):
+    bu_ledgers = {r["PrimaryLedgerName"] for r in bu_rows if r["PrimaryLedgerName"]}
+    for led in sorted(ledger_names - mapped_ledgers - bu_ledgers):
         rows1.append({
             "Ledger Name": led,
             "Legal Entity Identifier": "",
@@ -271,22 +260,9 @@ else:
             "Business Unit": ""
         })
 
-    # Orphan LEs (present in XLE but not seen elsewhere)
-    covered_idents = {i for (_, i) in seen_pairs} | seen_le_idents_with_bu
-    for ident in sorted(xle_identifiers - covered_idents):
-        leds = ident_to_ledgers.get(ident, set())
-        led_guess = next(iter(leds)) if len(leds) == 1 else ""
-        rows1.append({
-            "Ledger Name": led_guess,
-            "Legal Entity Identifier": ident,
-            "Legal Entity": ident_to_le_name.get(ident, ""),
-            "Business Unit": ""
-        })
-
     df1 = pd.DataFrame(rows1).drop_duplicates(
         subset=["Ledger Name", "Legal Entity Identifier", "Business Unit"]
     ).reset_index(drop=True)
-
     df1["__LedgerEmpty"] = (df1["Ledger Name"].fillna("") == "").astype(int)
     df1 = (df1.sort_values(
                 ["__LedgerEmpty", "Ledger Name", "Legal Entity", "Business Unit"],
@@ -295,7 +271,7 @@ else:
     df1.insert(0, "Assignment", range(1, len(df1) + 1))
 
     # ===================================================
-    # Tab 2: Inventory Org Structure (identifier-aware)
+    # Tab 2: Inventory Org Structure
     # ===================================================
     rows2 = []
     co_name_by_joinkey = {r["JoinKey"]: r["Name"] for r in costorg_rows if r.get("JoinKey")}
@@ -322,18 +298,17 @@ else:
 
         if leds:
             for led in sorted(leds):
-                row = {"Ledger Name": led}
-                row.update(base_row)
-                rows2.append(row)
+                rrow = {"Ledger Name": led}
+                rrow.update(base_row)
+                rows2.append(rrow)
         else:
-            row = {"Ledger Name": ""}
-            row.update(base_row)
-            rows2.append(row)
+            rrow = {"Ledger Name": ""}
+            rrow.update(base_row)
+            rows2.append(rrow)
 
     df2 = pd.DataFrame(rows2).drop_duplicates(
         subset=["Ledger Name", "Legal Entity Identifier", "Cost Organization", "Inventory Org"]
     ).reset_index(drop=True)
-
     if not df2.empty:
         df2["__LedgerEmpty"] = (df2["Ledger Name"].fillna("") == "").astype(int)
         df2["__COEmpty"]     = (df2["Cost Organization"].fillna("") == "").astype(int)
@@ -349,7 +324,7 @@ else:
     df2.insert(0, "Assignment", range(1, len(df2) + 1))
 
     # ===================================================
-    # Tab 3: Costing Structure (identifier-aware)
+    # Tab 3: Costing Structure
     # ===================================================
     rows3 = []
     for co in costorg_rows:
@@ -371,13 +346,13 @@ else:
             }
             if leds:
                 for led in sorted(leds):
-                    r = {"Ledger Name": led}
-                    r.update(base)
-                    rows3.append(r)
+                    rr = {"Ledger Name": led}
+                    rr.update(base)
+                    rows3.append(rr)
             else:
-                r = {"Ledger Name": ""}
-                r.update(base)
-                rows3.append(r)
+                rr = {"Ledger Name": ""}
+                rr.update(base)
+                rows3.append(rr)
             continue
 
         for (bk, is_primary) in sorted(books, key=lambda x: (x[0], not x[1])):
@@ -390,18 +365,17 @@ else:
             }
             if leds:
                 for led in sorted(leds):
-                    r = {"Ledger Name": led}
-                    r.update(base)
-                    rows3.append(r)
+                    rr = {"Ledger Name": led}
+                    rr.update(base)
+                    rows3.append(rr)
             else:
-                r = {"Ledger Name": ""}
-                r.update(base)
-                rows3.append(r)
+                rr = {"Ledger Name": ""}
+                rr.update(base)
+                rows3.append(rr)
 
     df3 = pd.DataFrame(rows3).drop_duplicates(
         subset=["Ledger Name", "Legal Entity Identifier", "Cost Organization", "Cost Book", "Primary Cost Book"]
     ).reset_index(drop=True)
-
     if not df3.empty:
         df3["__LedgerEmpty"] = (df3["Ledger Name"].fillna("") == "").astype(int)
         df3 = (
@@ -436,6 +410,7 @@ else:
         file_name="EnterpriseStructure.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 
 # ===================== DRAW.IO DIAGRAM (CO straight down + GLOBAL MIN SPACING + guided trunk) =====================
 if (
