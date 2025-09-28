@@ -346,8 +346,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # Diagram section intentionally deferred until Excel is signed off.
-# ===================== DRAW.IO DIAGRAM BLOCK (with Inventory Orgs) =====================
+    # ===================== DRAW.IO DIAGRAM BLOCK (Cost Books + Inventory Orgs) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -355,7 +354,7 @@ if (
     import xml.etree.ElementTree as ET
     import zlib, base64, uuid
 
-    def _make_drawio_xml(df_bu: pd.DataFrame, df_io: pd.DataFrame) -> str:
+    def _make_drawio_xml(df_bu: pd.DataFrame, df_co_books: pd.DataFrame) -> str:
         # --- layout & spacing ---
         W, H       = 180, 48
         X_STEP     = 230
@@ -368,7 +367,7 @@ if (
         Y_BU       = 470
         Y_CO       = 630
         Y_CB       = 790
-        Y_IO       = 950  # Inventory Orgs sit *below* Cost Books
+        Y_IO       = 950  # NEW: Inventory Orgs under Cost Books
 
         # --- styles ---
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -377,23 +376,30 @@ if (
         S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#E2F7E2;strokeColor=#3D8B3D;fontSize=12;"
         S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#7FBF7F;strokeColor=#2F7D2F;fontSize=12;"
         # Inventory Orgs
-        S_IO      = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#2F71A8;fontSize=12;"
+        S_IO       = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#2F71A8;fontSize=12;"
         S_IO_PLANT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
 
         S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
                     "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
+        S_HDR    = "text;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;"
 
-        # --- normalize inputs ---
-        df_io = df_io.fillna("")
-        df_bu = df_bu.fillna("")
+        # --- normalize input ---
+        df_bu = df_bu[["Ledger Name", "Legal Entity", "Business Unit"]].copy()
+        df_co_books = df_co_books[[
+            "Ledger Name", "Legal Entity", "Cost Organization", "Cost Book",
+            "Inventory Org", "Manufacturing Plant"
+        ]].copy()
+        for df in (df_bu, df_co_books):
+            for c in df.columns:
+                df[c] = df[c].fillna("").map(str).str.strip()
 
-        ledgers_all = sorted([x for x in set(df_bu["Ledger Name"]) | set(df_io["Ledger Name"]) if x])
+        ledgers_all = sorted([x for x in set(df_bu["Ledger Name"]) | set(df_co_books["Ledger Name"]) if x])
 
         # maps
         le_map, bu_map, co_map, cb_map, io_map = {}, {}, {}, {}, {}
 
         for _, r in pd.concat([df_bu[["Ledger Name","Legal Entity"]],
-                               df_io[["Ledger Name","Legal Entity"]]]).drop_duplicates().iterrows():
+                               df_co_books[["Ledger Name","Legal Entity"]]]).drop_duplicates().iterrows():
             if r["Ledger Name"] and r["Legal Entity"]:
                 le_map.setdefault(r["Ledger Name"], set()).add(r["Legal Entity"])
 
@@ -401,15 +407,15 @@ if (
             if r["Ledger Name"] and r["Legal Entity"] and r["Business Unit"]:
                 bu_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Business Unit"])
 
-        for _, r in df_io.iterrows():
+        for _, r in df_co_books.iterrows():
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"]:
                 co_map.setdefault((r["Ledger Name"], r["Legal Entity"]), set()).add(r["Cost Organization"])
 
-        for _, r in df_io.iterrows():
+        for _, r in df_co_books.iterrows():
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"]:
                 cb_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]), set()).add(r["Cost Book"])
 
-        for _, r in df_io.iterrows():
+        for _, r in df_co_books.iterrows():
             if r["Ledger Name"] and r["Legal Entity"] and r["Cost Organization"] and r["Cost Book"] and r["Inventory Org"]:
                 io_map.setdefault((r["Ledger Name"], r["Legal Entity"], r["Cost Organization"], r["Cost Book"]), []).append({
                     "Name": r["Inventory Org"],
@@ -436,11 +442,10 @@ if (
                 "x": str(int(x)), "y": str(int(y)), "width": str(W), "height": str(H), "as": "geometry"})
             return vid
 
-        def add_edge(src, tgt, dashed=False):
+        def add_edge(src, tgt):
             eid = uuid.uuid4().hex[:8]
-            style = S_EDGE + ("dashed=1;" if dashed else "")
             c = ET.SubElement(root, "mxCell", attrib={
-                "id": eid, "value": "", "style": style, "edge": "1", "parent": "1",
+                "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
                 "source": src, "target": tgt})
             ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
 
@@ -450,29 +455,52 @@ if (
 
         for L in ledgers_all:
             id_map[("L", L)] = add_vertex(L, S_LEDGER, next_x, Y_LEDGER)
-            les = sorted(le_map.get(L, []))
-            for le in les:
+            for le in sorted(le_map.get(L, [])):
                 id_map[("E", L, le)] = add_vertex(le, S_LE, next_x, Y_LE)
                 add_edge(id_map[("E", L, le)], id_map[("L", L)])
-                # BUs
                 for b in sorted(bu_map.get((L, le), [])):
                     id_map[("B", L, le, b)] = add_vertex(b, S_BU, next_x, Y_BU)
                     add_edge(id_map[("B", L, le, b)], id_map[("E", L, le)])
-                # Cost Orgs
                 for c in sorted(co_map.get((L, le), [])):
                     id_map[("C", L, le, c)] = add_vertex(c, S_CO, next_x, Y_CO)
                     add_edge(id_map[("C", L, le, c)], id_map[("E", L, le)])
-                    # Cost Books
                     for cb in sorted(cb_map.get((L, le, c), [])):
                         id_map[("CB", L, le, c, cb)] = add_vertex(cb, S_CB, next_x, Y_CB)
                         add_edge(id_map[("CB", L, le, c, cb)], id_map[("C", L, le, c)])
-                        # Inventory Orgs under CB
                         for io in io_map.get((L, le, c, cb), []):
                             io_label = f"🏭 {io['Name']}" if io["Mfg"].lower() == "yes" else io["Name"]
                             style = S_IO_PLANT if io["Mfg"].lower() == "yes" else S_IO
                             id_map[("IO", L, le, c, cb, io["Name"])] = add_vertex(io_label, style, next_x, Y_IO)
-                            add_edge(id_map[("IO", L, le, c, cb, io["Name"])], id_map[("C", L, le, c)])  # link to Cost Org
+                            add_edge(id_map[("IO", L, le, c, cb, io["Name"])], id_map[("C", L, le, c)])
             next_x += X_STEP + PAD_GROUP
+
+        # --- legend ---
+        def add_legend(x=20, y=20):
+            def swatch(lbl, color, offset, stroke="#666666", bold=False):
+                style = f"rounded=1;fillColor={color};strokeColor={stroke};"
+                if bold: style += "strokeWidth=2;"
+                box = ET.SubElement(root, "mxCell", attrib={
+                    "id": uuid.uuid4().hex[:8], "value": "",
+                    "style": style,
+                    "vertex": "1", "parent": "1"})
+                ET.SubElement(box, "mxGeometry", attrib={
+                    "x": str(x+12), "y": str(y+offset), "width": "18", "height": "12", "as": "geometry"})
+                txt = ET.SubElement(root, "mxCell", attrib={
+                    "id": uuid.uuid4().hex[:8], "value": lbl,
+                    "style": "text;align=left;verticalAlign=middle;fontSize=12;",
+                    "vertex": "1", "parent": "1"})
+                ET.SubElement(txt, "mxGeometry", attrib={
+                    "x": str(x+36), "y": str(y+offset-4), "width": "170", "height": "20", "as": "geometry"})
+
+            swatch("Ledger", "#FFE6E6", 36)
+            swatch("Legal Entity", "#FFE2C2", 62)
+            swatch("Business Unit", "#FFF1B3", 88)
+            swatch("Cost Org", "#E2F7E2", 114)
+            swatch("Cost Book", "#7FBF7F", 140)
+            swatch("Inventory Org", "#D6EFFF", 166, stroke="#2F71A8")
+            swatch("Manufacturing Plant (IO)", "#D6EFFF", 192, stroke="#1F4D7A", bold=True)
+
+        add_legend()
 
         return ET.tostring(mxfile, encoding="utf-8", method="xml").decode("utf-8")
 
@@ -491,3 +519,4 @@ if (
         use_container_width=True
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
+
