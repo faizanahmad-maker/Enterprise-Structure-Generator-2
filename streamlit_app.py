@@ -463,7 +463,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ===================== DRAW.IO DIAGRAM BLOCK (Swimlanes + min IO gap + hybrid BU + Mfg style) =====================
+# ===================== DRAW.IO DIAGRAM BLOCK (Swimlanes + Hybrid BU + Min IO Gap + Low Elbows) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -472,28 +472,10 @@ if (
     import zlib, base64, uuid
 
     def _make_drawio_xml(df_bu: pd.DataFrame, df_tab2: pd.DataFrame) -> str:
-        # ---------- geometry ----------
+        # ----- geometry -----
         W, H = 180, 48
 
-        # Lane layout (relative to LE center)
-        LANE_OFFSET_CO = 0           # CO lane = LE center
-        BOOK_OFFSET_LEFT = 140       # Cost Books sit this far LEFT of the CO center
-        # BU lane offset equals cost-book offset (your request)
-        BU_LANE_LEFT = BOOK_OFFSET_LEFT
-
-        # Minimum horizontal gaps inside lanes
-        IO_MIN_GAP = 40              # ensure boxes never collide
-        BU_SPREAD_BASE  = 190
-        CO_SPREAD_BASE  = 220
-        DIO_SPREAD_BASE = 190
-        IO_UNDER_CO_SPREAD_BASE = 170
-
-        # inter-block padding
-        LEDGER_BLOCK_GAP = 120
-        CLUSTER_GAP      = 360
-        LEFT_PAD         = 260
-
-        # vertical rows
+        # Rows
         Y_LEDGER = 150
         Y_LE     = 320
         Y_BU     = 480
@@ -501,7 +483,39 @@ if (
         Y_CB     = 800
         Y_IO     = 960
 
-        # ---------- styles ----------
+        # Low elbows (closer to the child row, but still between rows)
+        def low_elbow(y_child, y_parent, bias=0.75):
+            # y increases downwards; parent is above child
+            return int(y_parent + (y_child - y_parent) * bias)
+
+        ELBOW_LE_TO_LED = low_elbow(Y_LE, Y_LEDGER)   # LE -> Ledger
+        ELBOW_BU_TO_LE  = low_elbow(Y_BU, Y_LE)       # BU -> LE
+        ELBOW_CO_TO_LE  = low_elbow(Y_CO, Y_LE)       # CO -> LE
+        ELBOW_CB_TO_CO  = low_elbow(Y_CB, Y_CO)       # Cost Book -> CO
+        ELBOW_IO_TO_CO  = low_elbow(Y_IO, Y_CO)       # IO (under CO) -> CO
+        ELBOW_DIO_TO_LE = low_elbow(Y_IO, Y_LE)       # Direct IO -> LE
+
+        # Lanes (relative to LE center)
+        BOOK_OFFSET_LEFT = 140        # cost books sit left of CO
+        BU_LANE_LEFT     = BOOK_OFFSET_LEFT
+        DIO_LANE_RIGHT   = BOOK_OFFSET_LEFT
+
+        # Spacing inside lanes (respect min gap so boxes never touch)
+        MIN_GAP = 40
+        BU_SPREAD_BASE   = 190
+        CO_SPREAD_BASE   = 220
+        DIO_SPREAD_BASE  = 190
+        IO_UNDER_CO_BASE = 170
+        BOOK_SPREAD_BASE = 160
+
+        def spread(base): return max(base, W + MIN_GAP)
+
+        # Inter-block layout
+        LEDGER_BLOCK_GAP = 120
+        CLUSTER_GAP      = 360
+        LEFT_PAD         = 260
+
+        # ----- styles -----
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
         S_LE     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE2C2;strokeColor=#A66000;fontSize=12;"
         S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
@@ -513,26 +527,26 @@ if (
         S_EDGE = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
                   "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
 
-        # ---------- normalize ----------
+        # ----- normalize source data -----
         df_bu = df_bu.fillna("").copy()
         df2   = df_tab2.fillna("").copy()
 
-        # LEs per ledger from BOTH tabs
+        # Build ledger → {LE} from BOTH tabs
         ledger_to_les = {}
         for _, r in pd.concat([
-            df_bu[["Ledger Name","Legal Entity"]],
-            df2[["Ledger Name","Legal Entity"]]
+            df_bu[["Ledger Name", "Legal Entity"]],
+            df2[["Ledger Name", "Legal Entity"]],
         ]).drop_duplicates().iterrows():
             L, E = r["Ledger Name"], r["Legal Entity"]
             if L and E:
                 ledger_to_les.setdefault(L, set()).add(E)
 
-        # BU by (L,E)
+        # BU by LE
         bu_by_le = {}
         for _, r in df_bu.iterrows():
             L, E, B = r["Ledger Name"], r["Legal Entity"], r["Business Unit"]
             if L and E and B:
-                bu_by_le.setdefault((L,E), set()).add(B)
+                bu_by_le.setdefault((L, E), set()).add(B)
 
         # CO, Books, IO-under-CO
         co_by_le, cb_by_co, io_by_co = {}, {}, {}
@@ -540,16 +554,15 @@ if (
             L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
             CB, IO, MFG = r["Cost Book"], r["Inventory Org"], (r.get("Manufacturing Plant","") or "")
             if L and E and C:
-                co_by_le.setdefault((L,E), set()).add(C)
+                co_by_le.setdefault((L, E), set()).add(C)
                 if CB:
                     for bk in [b.strip() for b in CB.split(";") if b.strip()]:
-                        cb_by_co.setdefault((L,E,C), set()).add(bk)
+                        cb_by_co.setdefault((L, E, C), set()).add(bk)
                 if IO:
-                    io_by_co.setdefault((L,E,C), [])
                     rec = {"Name": IO, "Mfg": str(MFG).strip().lower() in ("yes","y","true","1")}
-                    # de-dup by name
-                    if all(x["Name"] != IO for x in io_by_co[(L,E,C)]):
-                        io_by_co[(L,E,C)].append(rec)
+                    io_by_co.setdefault((L, E, C), [])
+                    if all(x["Name"] != rec["Name"] for x in io_by_co[(L, E, C)]):
+                        io_by_co[(L, E, C)].append(rec)
 
         # Direct IOs (no CO)
         dio_by_le = {}
@@ -557,95 +570,86 @@ if (
             L, E, C, IO = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"], r["Inventory Org"]
             MFG = (r.get("Manufacturing Plant","") or "")
             if L and E and not C and IO:
-                dio_by_le.setdefault((L,E), [])
                 rec = {"Name": IO, "Mfg": str(MFG).strip().lower() in ("yes","y","true","1")}
-                if all(x["Name"] != IO for x in dio_by_le[(L,E)]):
-                    dio_by_le[(L,E)].append(rec)
+                dio_by_le.setdefault((L, E), [])
+                if all(x["Name"] != rec["Name"] for x in dio_by_le[(L, E)]):
+                    dio_by_le[(L, E)].append(rec)
 
         # helpers
-        def spread_with_min(base):
-            return max(base, W + IO_MIN_GAP)
-
         def centered_positions(center_x, n, base_spread):
-            spread = spread_with_min(base_spread)
+            s = spread(base_spread)
             if n <= 0: return []
             if n == 1: return [center_x]
-            start = center_x - (spread * (n - 1)) / 2.0
-            return [start + i * spread for i in range(n)]
+            start = center_x - (s * (n - 1)) / 2.0
+            return [start + i * s for i in range(n)]
 
-        # ---------- place nodes ----------
-        next_x   = LEFT_PAD
-        led_x    = {}
-        le_x     = {}
-        bu_x     = {}
-        co_x     = {}
-        cb_x     = {}
-        io_x     = {}
-        dio_x    = {}
-        bounds   = {}
+        # ----- place nodes -----
+        next_x = LEFT_PAD
+        led_x  = {}
+        le_x   = {}
+        bu_x   = {}
+        co_x   = {}
+        cb_x   = {}
+        io_x   = {}   # (L,E,C,io) -> (x, is_mfg)
+        dio_x  = {}   # (L,E,io)   -> (x, is_mfg)
 
         for L in sorted(ledger_to_les.keys()):
-            le_centers = []
+            centers = []
             for E in sorted(ledger_to_les[L]):
                 cx = next_x
-                le_x[(L,E)] = cx
-                le_centers.append(cx)
+                le_x[(L, E)] = cx
+                centers.append(cx)
 
-                # lane centers relative to LE
-                co_center  = cx + LANE_OFFSET_CO
-                # default BU lane left of LE by cost-book offset
-                bu_center_default  = cx - BU_LANE_LEFT
-                dio_center = cx + BU_LANE_LEFT  # symmetric to BU lane on right
+                # Determine lane centers
+                co_center  = cx                               # CO lane = center
+                bu_center  = cx - BU_LANE_LEFT                # BU lane left
+                dio_center = cx + DIO_LANE_RIGHT              # direct IO right
 
-                # Hybrid rule: if no CO and no Direct IO => center BUs under LE
-                has_co  = len(co_by_le.get((L,E), [])) > 0
-                has_dio = len(dio_by_le.get((L,E), [])) > 0
-                bu_center = cx if (not has_co and not has_dio) else bu_center_default
+                # Hybrid rule: if no COs & no Direct IOs, center BUs under LE
+                has_co  = len(co_by_le.get((L, E), [])) > 0
+                has_dio = len(dio_by_le.get((L, E), [])) > 0
+                if not has_co and not has_dio:
+                    bu_center = cx
 
                 # BUs
-                bu_list = sorted(bu_by_le.get((L,E), []))
+                bu_list = sorted(bu_by_le.get((L, E), []))
                 for x, b in zip(centered_positions(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
-                    bu_x[(L,E,b)] = x
+                    bu_x[(L, E, b)] = x
 
-                # COs + books + IOs under CO
-                co_list = sorted(co_by_le.get((L,E), []))
+                # COs (+ books left, IOs under)
+                co_list = sorted(co_by_le.get((L, E), []))
                 for x, c in zip(centered_positions(co_center, len(co_list), CO_SPREAD_BASE), co_list):
-                    co_x[(L,E,c)] = x
-                    # books (left of CO)
-                    books = sorted(cb_by_co.get((L,E,c), []))
+                    co_x[(L, E, c)] = x
+                    # Books
+                    books = sorted(cb_by_co.get((L, E, c), []))
                     for k, bk in enumerate(books):
-                        cb_x[(L,E,c,bk)] = x - BOOK_OFFSET_LEFT + k * spread_with_min(BOOK_SPREAD_BASE := 160)
-                    # IOs under this CO
-                    ios = sorted(io_by_co.get((L,E,c), []), key=lambda d: d["Name"])
-                    for xio, rec in zip(centered_positions(x, len(ios), IO_UNDER_CO_SPREAD_BASE), ios):
-                        io_x[(L,E,c,rec["Name"])] = (xio, rec["Mfg"])
+                        cb_x[(L, E, c, bk)] = x - BOOK_OFFSET_LEFT + k * spread(BOOK_SPREAD_BASE)
+                    # IO under this CO
+                    ios = sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])
+                    for xio, rec in zip(centered_positions(x, len(ios), IO_UNDER_CO_BASE), ios):
+                        io_x[(L, E, c, rec["Name"])] = (xio, rec["Mfg"])
 
                 # Direct IOs
-                dios = sorted(dio_by_le.get((L,E), []), key=lambda d: d["Name"])
+                dios = sorted(dio_by_le.get((L, E), []), key=lambda d: d["Name"])
                 for x, rec in zip(centered_positions(dio_center, len(dios), DIO_SPREAD_BASE), dios):
-                    dio_x[(L,E,rec["Name"])] = (x, rec["Mfg"])
+                    dio_x[(L, E, rec["Name"])] = (x, rec["Mfg"])
 
-                # compute block width
+                # advance by actual block width
                 xs = [cx]
-                xs += [bu_x[(L,E,b)] for b in bu_list]
-                xs += [co_x[(L,E,c)] for c in co_list]
-                xs += [x for (x, _m) in dio_x.items() if (L,E) == (list(k[:2])[0], list(k[:2])[1])]  # filled below after we add all
-                # include books and io-under-co
+                xs += [bu_x[(L, E, b)] for b in bu_list]
+                xs += [co_x[(L, E, c)] for c in co_list]
+                xs += [v[0] for k, v in dio_x.items() if k[:2] == (L, E)]
                 for c in co_list:
-                    xs += [cb_x[(L,E,c,bk)] for bk in sorted(cb_by_co.get((L,E,c), []))]
-                    xs += [io_x[(L,E,c,name)][0] for name in [d["Name"] for d in sorted(io_by_co.get((L,E,c), []), key=lambda d: d["Name"])]]
-                # also include direct IOs explicitly (since above comprehension is awkward)
-                xs += [v[0] for k, v in dio_x.items() if k[:2] == (L,E)]
-
+                    xs += [cb_x[(L, E, c, bk)] for bk in sorted(cb_by_co.get((L, E, c), []))]
+                    xs += [io_x[(L, E, c, rec["Name"])][0] for rec in sorted(io_by_co.get((L, E, c), []), key=lambda d: d["Name"])]
                 min_x = min(xs) - W/2
                 max_x = max(xs) + W/2
-                bounds[(L,E)] = (min_x, max_x)
                 next_x = max_x + LEDGER_BLOCK_GAP
 
-            led_x[L] = int(sum(le_centers)/len(le_centers)) if le_centers else next_x
+            led_x[L] = int(sum(centers)/len(centers)) if centers else next_x
             next_x += CLUSTER_GAP
 
-        # ---------- XML ----------
+        # ----- XML skeleton -----
         mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
         diagram = ET.SubElement(mxfile, "diagram", attrib={"id": str(uuid.uuid4()), "name": "Enterprise Structure"})
         model   = ET.SubElement(diagram, "mxGraphModel", attrib={
@@ -661,10 +665,20 @@ if (
             ET.SubElement(c,"mxGeometry",attrib={"x":str(int(x)),"y":str(int(y)),"width":str(w),"height":str(h),"as":"geometry"})
             return vid
 
-        def add_edge(src, tgt):
+        def add_edge_with_elbow(src_id, tgt_id, src_center_x, tgt_center_x, elbow_y):
             eid = uuid.uuid4().hex[:8]
-            c = ET.SubElement(root,"mxCell",attrib={"id":eid,"value":"","style":S_EDGE,"edge":"1","parent":"1","source":src,"target":tgt})
-            ET.SubElement(c,"mxGeometry",attrib={"relative":"1","as":"geometry"})
+            c = ET.SubElement(root, "mxCell", attrib={
+                "id": eid, "value": "", "style": S_EDGE, "edge": "1", "parent": "1",
+                "source": src_id, "target": tgt_id
+            })
+            g = ET.SubElement(c, "mxGeometry", attrib={"relative": "1", "as": "geometry"})
+            arr = ET.SubElement(g, "Array", attrib={"as": "points"})
+            # vertical out of source to elbow, across, then up to target
+            ET.SubElement(arr, "mxPoint", attrib={"x": str(int(src_center_x)), "y": str(int(elbow_y))})
+            ET.SubElement(arr, "mxPoint", attrib={"x": str(int(tgt_center_x)), "y": str(int(elbow_y))})
+
+        def cx(x_left):  # left x -> center x
+            return int(x_left + W/2)
 
         id_map = {}
         # Ledgers
@@ -672,40 +686,40 @@ if (
             id_map[("L", L)] = add_vertex(L, S_LEDGER, led_x[L], Y_LEDGER)
 
         # LEs
-        for (L,E), x in le_x.items():
-            id_map[("E",L,E)] = add_vertex(E, S_LE, x, Y_LE)
-            add_edge(id_map[("E",L,E)], id_map[("L",L)])
+        for (L, E), x in le_x.items():
+            id_map[("E", L, E)] = add_vertex(E, S_LE, x, Y_LE)
+            add_edge_with_elbow(id_map[("E", L, E)], id_map[("L", L)], cx(x), cx(led_x[L]), ELBOW_LE_TO_LED)
 
         # BUs
-        for (L,E,b), x in bu_x.items():
-            id_map[("B",L,E,b)] = add_vertex(b, S_BU, x, Y_BU)
-            add_edge(id_map[("B",L,E,b)], id_map[("E",L,E)])
+        for (L, E, b), x in bu_x.items():
+            id_map[("B", L, E, b)] = add_vertex(b, S_BU, x, Y_BU)
+            add_edge_with_elbow(id_map[("B", L, E, b)], id_map[("E", L, E)], cx(x), cx(le_x[(L, E)]), ELBOW_BU_TO_LE)
 
         # COs
-        for (L,E,c), x in co_x.items():
-            id_map[("C",L,E,c)] = add_vertex(c, S_CO, x, Y_CO)
-            add_edge(id_map[("C",L,E,c)], id_map[("E",L,E)])
+        for (L, E, c), x in co_x.items():
+            id_map[("C", L, E, c)] = add_vertex(c, S_CO, x, Y_CO)
+            add_edge_with_elbow(id_map[("C", L, E, c)], id_map[("E", L, E)], cx(x), cx(le_x[(L, E)]), ELBOW_CO_TO_LE)
 
         # Cost Books
-        for (L,E,c,bk), x in cb_x.items():
-            id_map[("CB",L,E,c,bk)] = add_vertex(bk, S_CB, x, Y_CB)
-            add_edge(id_map[("CB",L,E,c,bk)], id_map[("C",L,E,c)])
+        for (L, E, c, bk), x in cb_x.items():
+            id_map[("CB", L, E, c, bk)] = add_vertex(bk, S_CB, x, Y_CB)
+            add_edge_with_elbow(id_map[("CB", L, E, c, bk)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L, E, c)]), ELBOW_CB_TO_CO)
 
-        # IOs under CO (respect Mfg bold style)
-        for (L,E,c,io_name), (x, is_mfg) in io_x.items():
+        # IOs under CO
+        for (L, E, c, name), (x, is_mfg) in io_x.items():
             style = S_IO_PLT if is_mfg else S_IO
-            label = f"🏭 {io_name}" if is_mfg else io_name
-            id_map[("IO",L,E,c,io_name)] = add_vertex(label, style, x, Y_IO)
-            add_edge(id_map[("IO",L,E,c,io_name)], id_map[("C",L,E,c)])
+            label = f"🏭 {name}" if is_mfg else name
+            id_map[("IO", L, E, c, name)] = add_vertex(label, style, x, Y_IO)
+            add_edge_with_elbow(id_map[("IO", L, E, c, name)], id_map[("C", L, E, c)], cx(x), cx(co_x[(L, E, c)]), ELBOW_IO_TO_CO)
 
-        # Direct IOs (right lane)
-        for (L,E,io_name), (x, is_mfg) in dio_x.items():
+        # Direct IOs
+        for (L, E, name), (x, is_mfg) in dio_x.items():
             style = S_IO_PLT if is_mfg else S_IO
-            label = f"🏭 {io_name}" if is_mfg else io_name
-            id_map[("DIO",L,E,io_name)] = add_vertex(label, style, x, Y_IO)
-            add_edge(id_map[("DIO",L,E,io_name)], id_map[("E",L,E)])
+            label = f"🏭 {name}" if is_mfg else name
+            id_map[("DIO", L, E, name)] = add_vertex(label, style, x, Y_IO)
+            add_edge_with_elbow(id_map[("DIO", L, E, name)], id_map[("E", L, E)], cx(x), cx(le_x[(L, E)]), ELBOW_DIO_TO_LE)
 
-        # Legend (with Manufacturing Plant style)
+        # Legend
         def add_legend(x=20, y=20):
             _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 250, 184)
             items = [
@@ -718,10 +732,10 @@ if (
                 ("Manufacturing Plant (IO)", "#C2E0F9", "bold"),
             ]
             for i, (lbl, col, flavor) in enumerate(items):
-                box_style = f"rounded=1;fillColor={col};strokeColor=#666666;"
+                style = f"rounded=1;fillColor={col};strokeColor=#666666;"
                 if flavor == "bold":
-                    box_style = "rounded=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;"
-                add_vertex("", box_style, x+12, y+28+i*22, 18, 12)
+                    style = "rounded=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;"
+                add_vertex("", style, x+12, y+28+i*22, 18, 12)
                 add_vertex(lbl, "text;align=left;verticalAlign=middle;fontSize=12;", x+36, y+24+i*22, 200, 20)
 
         add_legend()
@@ -742,5 +756,6 @@ if (
         use_container_width=True
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
+# ===================== END DRAW.IO BLOCK =====================
 
 
