@@ -656,10 +656,36 @@ if (
                             cb_xy[(L,E,C,bk)] = (xbk, ybk)
 
                 # Direct-to-LE IOs (rightmost lane)
-                if has_dio:
-                    dlist = sorted(dio_by_le[(L,E)], key=lambda d: d["Name"])
-                    for xio, rec in zip(centers(dio_center, len(dlist), IO_UNDER_CO_BASE), dlist):
-                        dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
+                # --- Direct-to-LE IOs: restore shared vertical trunk routing ---
+                # Compute a trunk X for each (Ledger, LE)
+                TRUNK_RIGHT_BIAS = 90  # keeps the trunk a bit to the right for clarity
+                dio_trunk_x = {}
+                for (L,E), _ in {(k[0], k[1]): None for k in dio_x.keys()}:
+                    xs = [dio_x[(L,E,name)][0] for name in [k[2] for k in dio_x.keys() if k[0]==L and k[1]==E]]
+                    if xs:
+                        le_center_x = cx(le_x[(L,E)])
+                        dio_trunk_x[(L,E)] = int(sum(xs)/len(xs)) + TRUNK_RIGHT_BIAS
+                    else:
+                        dio_trunk_x[(L,E)] = cx(le_x[(L,E)]) + TRUNK_RIGHT_BIAS
+                
+                # Draw nodes + edges for direct IOs using the shared trunk
+                for (L,E,name), (x, is_mfg) in dio_x.items():
+                    style = S_IO_PLT if str(is_mfg).lower() in ("yes","y","true","1") else S_IO
+                    label = f"🏭 {name}" if style == S_IO_PLT else name
+                    v = add_vertex(label, style, x, Y_IO)
+                
+                    le_center_x = cx(le_x[(L,E)])
+                    trunk_x = dio_trunk_x.get((L,E), max(le_center_x, x) + TRUNK_RIGHT_BIAS)
+                
+                    # Waypoints create the clean, shared “guided” path:
+                    #  - up to CO IO elbow, then up to BU elbow, then over to LE center
+                    add_edge_points(
+                        v, id_map[("E",L,E)],
+                        [(trunk_x, ELBOW_IO_TO_CO),
+                         (trunk_x, ELBOW_BU_TO_LE),
+                         (le_center_x, ELBOW_BU_TO_LE)]
+                    )
+
 
                 # umbrella/overlap control between LEs
                 xs_span = [le_pos]
