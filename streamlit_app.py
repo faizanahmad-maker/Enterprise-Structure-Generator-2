@@ -446,7 +446,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-  # ===================== DRAW.IO DIAGRAM (LE three-prong, vertical books, spacing, centered ledgers) =====================
+# ===================== DRAW.IO DIAGRAM (LE three-prong, vertical books, spacing, centered ledgers) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame) and
@@ -482,7 +482,7 @@ if (
         CO_LANE_OFFSET  = 180   # CO lane center is LE_x + offset
         DIO_LANE_OFFSET = 420   # direct IO lane further right
 
-        # cost-book column
+        # cost-book column (vertical)
         BOOK_X_OFFSET     = 220   # books at x = CO_x - BOOK_X_OFFSET
         BOOK_VERTICAL_GAP = 64
 
@@ -519,7 +519,7 @@ if (
         # ---------- Normalize inputs ----------
         df_bu = df_bu[["Ledger Name","Legal Entity","Business Unit"]].copy().fillna("").astype(str)
 
-        # IO tab (Tab 2)
+        # IO tab (Tab 2) — you removed Cost Book from Tab 2, so we don't read it here
         LCOL = pick(df_io, ["Ledger Name","Ledger"])
         ECOL = pick(df_io, ["Legal Entity","LegalEntity"])
         COCOL= pick(df_io, ["Cost Organization","Cost Org","CostOrganization"])
@@ -577,6 +577,7 @@ if (
                 if all(x["Name"] != IO for x in dio_by_le[(L,E)]):
                     dio_by_le[(L,E)].append(rec)
 
+        # Books from Costing tab (preferred; vertical column)
         for _, r in df_costing.iterrows():
             L,E,C = r.get("Ledger Name",""), r.get("Legal Entity",""), r.get("Cost Organization","")
             bk    = r.get("Cost Book","").strip()
@@ -592,7 +593,7 @@ if (
         io_x, dio_x, cb_xy = {}, {}, {}       # CB positions are (x,y)
         dio_lane_x = {}                        # (L,E) -> x center for direct IOs
 
-        # determine per-CO cluster half-width (accounts for vertical books on left + IO fan on right)
+        # determine per-CO cluster half-width (vertical books left + IO fan right)
         def co_cluster_halfwidth(L,E,C):
             ios = io_by_co[(L,E,C)]
             io_half = (max(1, len(ios)) * IO_UNDER_CO_BASE)/2 + W/2   # fan to right
@@ -617,7 +618,7 @@ if (
 
                 # three-prong lane centers
                 if has_bu and not has_co and not has_dio:
-                    bu_center = le_pos  # straight down
+                    bu_center = le_pos  # straight down (only BU)
                 else:
                     bu_center = le_pos - BU_LANE_OFFSET if has_bu else le_pos
                 co_center  = le_pos + CO_LANE_OFFSET if has_co else le_pos
@@ -656,36 +657,10 @@ if (
                             cb_xy[(L,E,C,bk)] = (xbk, ybk)
 
                 # Direct-to-LE IOs (rightmost lane)
-                # --- Direct-to-LE IOs: restore shared vertical trunk routing ---
-                # Compute a trunk X for each (Ledger, LE)
-                TRUNK_RIGHT_BIAS = 90  # keeps the trunk a bit to the right for clarity
-                dio_trunk_x = {}
-                for (L,E), _ in {(k[0], k[1]): None for k in dio_x.keys()}:
-                    xs = [dio_x[(L,E,name)][0] for name in [k[2] for k in dio_x.keys() if k[0]==L and k[1]==E]]
-                    if xs:
-                        le_center_x = cx(le_x[(L,E)])
-                        dio_trunk_x[(L,E)] = int(sum(xs)/len(xs)) + TRUNK_RIGHT_BIAS
-                    else:
-                        dio_trunk_x[(L,E)] = cx(le_x[(L,E)]) + TRUNK_RIGHT_BIAS
-                
-                # Draw nodes + edges for direct IOs using the shared trunk
-                for (L,E,name), (x, is_mfg) in dio_x.items():
-                    style = S_IO_PLT if str(is_mfg).lower() in ("yes","y","true","1") else S_IO
-                    label = f"🏭 {name}" if style == S_IO_PLT else name
-                    v = add_vertex(label, style, x, Y_IO)
-                
-                    le_center_x = cx(le_x[(L,E)])
-                    trunk_x = dio_trunk_x.get((L,E), max(le_center_x, x) + TRUNK_RIGHT_BIAS)
-                
-                    # Waypoints create the clean, shared “guided” path:
-                    #  - up to CO IO elbow, then up to BU elbow, then over to LE center
-                    add_edge_points(
-                        v, id_map[("E",L,E)],
-                        [(trunk_x, ELBOW_IO_TO_CO),
-                         (trunk_x, ELBOW_BU_TO_LE),
-                         (le_center_x, ELBOW_BU_TO_LE)]
-                    )
-
+                if has_dio:
+                    dlist = sorted(dio_by_le[(L,E)], key=lambda d: d["Name"])
+                    for xio, rec in zip(centers(dio_center, len(dlist), IO_UNDER_CO_BASE), dlist):
+                        dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
 
                 # umbrella/overlap control between LEs
                 xs_span = [le_pos]
@@ -722,7 +697,7 @@ if (
                 prev_umbrella_max_x = max_x_
                 next_x = max_x_ + LEDGER_BLOCK_GAP
 
-            # provisional ledger positions
+            # provisional ledgers for this cluster
             if le_centers:
                 led_x[L] = int(sum(le_x[(L,E)] for E in les) / len(les))
             else:
@@ -791,14 +766,36 @@ if (
             label = f"🏭 {name}" if style == S_IO_PLT else name
             id_map[("IO",L,E,c,name)] = add_vertex(label, style, x, Y_IO)
             add_edge_with_elbow(id_map[("IO",L,E,c,name)], id_map[("C",L,E,c)], cx(x), cx(co_x[(L,E,c)]), ELBOW_IO_TO_CO)
-        # Direct-to-LE IOs (third prong from LE)
+
+        # --- Direct-to-LE IOs: restore shared vertical trunk routing (guided path) ---
+        TRUNK_RIGHT_BIAS = 90
+        # Compute trunk X per (Ledger, LE)
+        dio_trunk_x = {}
+        for L in ledgers_all:
+            for E in sorted(le_map[L]):
+                xs = [pos[0] for (k,pos) in dio_x.items() if k[0]==L and k[1]==E]
+                if xs:
+                    dio_trunk_x[(L,E)] = int(sum(xs)/len(xs)) + TRUNK_RIGHT_BIAS
+                else:
+                    dio_trunk_x[(L,E)] = cx(le_x[(L,E)]) + TRUNK_RIGHT_BIAS
+
         for (L,E,name), (x, is_mfg) in dio_x.items():
             style = S_IO_PLT if str(is_mfg).lower() in ("yes","y","true","1") else S_IO
             label = f"🏭 {name}" if style == S_IO_PLT else name
             v = add_vertex(label, style, x, Y_IO)
-            add_edge_points(v, id_map[("E",L,E)], [(x, ELBOW_IO_TO_CO), (x, ELBOW_BU_TO_LE), (cx(le_x[(L,E)]), ELBOW_BU_TO_LE)])
 
-        # Compact legend (top-left)
+            le_center_x = cx(le_x[(L,E)])
+            trunk_x = dio_trunk_x.get((L,E), max(le_center_x, x) + TRUNK_RIGHT_BIAS)
+
+            # Waypoints: up to CO-IO elbow, then BU elbow, then across to LE center
+            add_edge_points(
+                v, id_map[("E",L,E)],
+                [(trunk_x, ELBOW_IO_TO_CO),
+                 (trunk_x, ELBOW_BU_TO_LE),
+                 (le_center_x, ELBOW_BU_TO_LE)]
+            )
+
+        # Legend (top-left)
         def add_legend(x=12, y=12):
             _ = add_vertex("", "rounded=1;fillColor=#FFFFFF;strokeColor=#CBD5E1;", x, y, 180, 176)
             items = [
