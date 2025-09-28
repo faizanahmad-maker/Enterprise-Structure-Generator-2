@@ -337,7 +337,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-  # ===================== DRAW.IO DIAGRAM BLOCK (Books left of CO, IOs centered under CO, no overlap) =====================
+ # ===================== DRAW.IO DIAGRAM BLOCK (IO min-gap + ledger group padding) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame)
@@ -347,19 +347,23 @@ if (
 
     def _make_drawio_xml(df_bu: pd.DataFrame, df_tab2: pd.DataFrame) -> str:
         # --- layout & spacing ---
-        W, H       = 180, 48
-        X_STEP     = 230               # spacing for BU / CO / Books
-        IO_STEP    = max(180, 115)     # MIN spacing for IOs; bump up if you want wider gaps
-        PAD_GROUP  = 60
-        LEFT_PAD   = 260
-        RIGHT_PAD  = 200
+        W, H           = 180, 48
+        X_STEP         = 230                # spacing for BU/CO/Books columns
+        IO_BASE_STEP   = 180                # desired base spacing for IOs
+        IO_GAP         = 40                 # extra horizontal breathing room between IO boxes
+        IO_STEP        = max(IO_BASE_STEP, W + IO_GAP)   # HARD minimum to prevent overlap
+
+        LEDGER_PAD     = 320                # minimum horizontal gap between ledger "umbrellas"
+        PAD_GROUP      = 60                 # minor pad inside a ledger cluster
+        LEFT_PAD       = 260
+        RIGHT_PAD      = 200
 
         Y_LEDGER   = 150
         Y_LE       = 310
         Y_BU       = 470
         Y_CO       = 630
-        Y_CB       = 790               # Cost Books row
-        Y_IO       = 1050              # IOs lower so connectors merge below books
+        Y_CB       = 790
+        Y_IO       = 1060  # lower so the merge point sits below the book row
 
         # --- styles ---
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -370,7 +374,7 @@ if (
         S_IO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#2F71A8;fontSize=12;"
         S_IO_PLT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#D6EFFF;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
 
-        # Edges: child top-center -> parent bottom-center (orthogonal elbows)
+        # Edges: child top-center → parent bottom-center (orthogonal elbows)
         S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
                     "jettySize=auto;strokeColor=#666666;exitX=0.5;exitY=0;entryX=0.5;entryY=1;")
         S_HDR    = "text;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;"
@@ -394,93 +398,100 @@ if (
         cb_by_co = {}   # (L,E,C) -> [book,...]
         io_by_co = {}   # (L,E,C) -> [{"Name":..., "Mfg":...}, ...]
 
-        # Ledger→LE
-        tmp = pd.concat([df_bu[["Ledger Name","Legal Entity"]], df[["Ledger Name","Legal Entity"]]]).drop_duplicates()
+        tmp = pd.concat([df_bu[["Ledger Name","Legal Entity"]],
+                         df[["Ledger Name","Legal Entity"]]]).drop_duplicates()
         for _, r in tmp.iterrows():
             L, E = r["Ledger Name"], r["Legal Entity"]
             if L and E:
                 le_map.setdefault(L, set()).add(E)
 
-        # LE→BU
         for _, r in df_bu.iterrows():
             L, E, B = r["Ledger Name"], r["Legal Entity"], r["Business Unit"]
             if L and E and B:
-                bu_map.setdefault((L, E), set()).add(B)
+                bu_map.setdefault((L,E), set()).add(B)
 
-        # LE→CO
         for _, r in df.iterrows():
             L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
             if L and E and C:
-                co_map.setdefault((L, E), set()).add(C)
+                co_map.setdefault((L,E), set()).add(C)
 
-        # CO→Books and CO→IOs
         for _, r in df.iterrows():
             L, E, C = r["Ledger Name"], r["Legal Entity"], r["Cost Organization"]
-            if not (L and E and C):
-                continue
             B, IO, MFG = r["Cost Book"], r["Inventory Org"], r["Manufacturing Plant"]
-
-            if B:
+            if L and E and C and B:
                 for bk in [b.strip() for b in B.split(";") if b.strip()]:
-                    cb_by_co.setdefault((L, E, C), []).append(bk)
-
-            if IO:
-                io_by_co.setdefault((L, E, C), [])
+                    cb_by_co.setdefault((L,E,C), []).append(bk)
+            if L and E and C and IO:
+                io_by_co.setdefault((L,E,C), [])
                 rec = {"Name": IO, "Mfg": (MFG or "")}
-                # de-dup IOs by name within the same CO
-                if all(x["Name"] != IO for x in io_by_co[(L, E, C)]):
-                    io_by_co[(L, E, C)].append(rec)
+                if all(x["Name"] != IO for x in io_by_co[(L,E,C)]):  # de-dup
+                    io_by_co[(L,E,C)].append(rec)
 
-        # --- x coordinates ---
+        # --- x coordinates with guaranteed ledger padding ---
         next_x = LEFT_PAD
         led_x, le_x, bu_x, co_x, cb_x, io_x = {}, {}, {}, {}, {}, {}
 
         for L in ledgers_all:
+            # Track x-positions used by this ledger to compute its span
+            ledger_x_used = []
+
             les = sorted(le_map.get(L, []))
             if not les:
-                led_x[L] = next_x; next_x += X_STEP + PAD_GROUP
-                continue
+                led_x[L] = next_x
+                ledger_x_used.append(next_x)
+                next_x = next_x + LEDGER_PAD
+            else:
+                for le in les:
+                    buses = sorted(bu_map.get((L, le), []))
+                    cos   = sorted(co_map.get((L, le), []))
 
-            for le in les:
-                buses = sorted(bu_map.get((L, le), []))
-                cos   = sorted(co_map.get((L, le), []))
+                    if not buses and not cos:
+                        le_x[(L, le)] = next_x; ledger_x_used.append(next_x); next_x += X_STEP
+                    else:
+                        for b in buses:
+                            if b not in bu_x:
+                                bu_x[b] = next_x; ledger_x_used.append(next_x); next_x += X_STEP
+                        for c in cos:
+                            if c not in co_x:
+                                co_x[c] = next_x; ledger_x_used.append(next_x); next_x += X_STEP
 
-                if not buses and not cos:
-                    le_x[(L, le)] = next_x; next_x += X_STEP
-                else:
-                    # allocate BUs (left), then COs (right)
-                    for b in buses:
-                        if b not in bu_x:
-                            bu_x[b] = next_x; next_x += X_STEP
+                        xs = [bu_x[b] for b in buses] + [co_x[c] for c in cos]
+                        le_center = int(sum(xs)/len(xs)) if xs else next_x
+                        le_x[(L, le)] = le_center
+                        ledger_x_used.append(le_center)
+
+                    # Under each CO: books to LEFT, IOs centered UNDER
                     for c in cos:
-                        if c not in co_x:
-                            co_x[c] = next_x; next_x += X_STEP
+                        base = co_x[c]
 
-                    xs = [bu_x[b] for b in buses] + [co_x[c] for c in cos]
-                    le_x[(L, le)] = int(sum(xs)/len(xs)) if xs else (next_x := next_x + X_STEP) - X_STEP
+                        # Books
+                        books = sorted(dict.fromkeys(cb_by_co.get((L, le, c), [])))
+                        for i, bk in enumerate(books, start=1):
+                            x_pos = base - i*X_STEP
+                            cb_x[(L, le, c, bk)] = x_pos
+                            ledger_x_used.append(x_pos)
 
-                # Under each CO: books to the LEFT; IOs centered UNDER (lower row)
-                for c in cos:
-                    base = co_x[c]
+                        # IOs (centered under CO), enforce min spacing
+                        ios = sorted(io_by_co.get((L, le, c), []), key=lambda k: k["Name"])
+                        n = len(ios)
+                        if n == 1:
+                            io_x[(L, le, c, ios[0]["Name"])] = base
+                            ledger_x_used.append(base)
+                        elif n > 1:
+                            start = base - ((n - 1) * IO_STEP) // 2
+                            for j, io in enumerate(ios):
+                                x_pos = start + j*IO_STEP
+                                io_x[(L, le, c, io["Name"])] = x_pos
+                                ledger_x_used.append(x_pos)
 
-                    # Books left of CO
-                    books = sorted(dict.fromkeys(cb_by_co.get((L, le, c), [])))
-                    for i, bk in enumerate(books, start=1):
-                        cb_x[(L, le, c, bk)] = base - i*X_STEP
+                # center ledger over its LEs
+                xs_led = [le_x[(L, le)] for le in les]
+                led_x[L] = int(sum(xs_led)/len(xs_led)) if xs_led else next_x
+                ledger_x_used.append(led_x[L])
 
-                    # IOs under CO (centered). If multiple, enforce min spacing.
-                    ios = sorted(io_by_co.get((L, le, c), []), key=lambda k: k["Name"])
-                    n = len(ios)
-                    if n == 1:
-                        io_x[(L, le, c, ios[0]["Name"])] = base
-                    elif n > 1:
-                        start = base - ((n - 1) * IO_STEP) // 2
-                        for j, io in enumerate(ios):
-                            io_x[(L, le, c, io["Name"])] = start + j*IO_STEP
-
-            xs = [le_x[(L, le)] for le in les]
-            led_x[L] = int(sum(xs)/len(xs)) if xs else next_x
-            next_x += PAD_GROUP
+                # after finishing this ledger, push the cursor to at least max_x + LEDGER_PAD
+                max_x_used = max(ledger_x_used) if ledger_x_used else next_x
+                next_x = max(next_x + PAD_GROUP, max_x_used + LEDGER_PAD)
 
         # --- XML skeleton ---
         mxfile  = ET.Element("mxfile", attrib={"host": "app.diagrams.net"})
@@ -531,17 +542,17 @@ if (
                 for c in sorted(co_map.get((L, le), [])):
                     id_map[("C", L, le, c)] = add_vertex(c, S_CO, co_x[c], Y_CO)
 
-                    # Books (left of CO)
+                    # Books
                     for bk in sorted(set(cb_by_co.get((L, le, c), []))):
                         id_map[("CB", L, le, c, bk)] = add_vertex(bk, S_CB, cb_x[(L, le, c, bk)], Y_CB)
 
-                    # IOs (centered under CO)
+                    # IOs
                     for io in sorted(io_by_co.get((L, le, c), []), key=lambda k: k["Name"]):
                         label = f"🏭 {io['Name']}" if str(io["Mfg"]).lower() == "yes" else io["Name"]
                         style = S_IO_PLT if str(io["Mfg"]).lower() == "yes" else S_IO
                         id_map[("IO", L, le, c, io["Name"])] = add_vertex(label, style, io_x[(L, le, c, io["Name"])], Y_IO)
 
-        # --- edges (child top-center -> parent bottom-center) ---
+        # --- edges (top-center → bottom-center) ---
         for L in ledgers_all:
             for le in sorted(le_map.get(L, [])):
                 if ("E", L, le) in id_map:
@@ -582,7 +593,7 @@ if (
                     "style": "text;align=left;verticalAlign=middle;fontSize=12;",
                     "vertex": "1", "parent": "1"})
                 ET.SubElement(txt, "mxGeometry", attrib={
-                    "x": str(x+36), "y": str(y+offset-4), "width": "240", "height": "20", "as": "geometry"})
+                    "x": str(x+36), "y": str(y+offset-4), "width": "250", "height": "20", "as": "geometry"})
             swatch("Ledger", "#FFE6E6", 36)
             swatch("Legal Entity", "#FFE2C2", 62)
             swatch("Business Unit", "#FFF1B3", 88)
@@ -609,4 +620,5 @@ if (
         use_container_width=True
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
+
 
