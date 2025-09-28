@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Enterprise Structure Generator", page_icon="📊", layout="wide")
-st.title("Enterprise Structure Generator — Excel + draw.io (identifier-safe, IO→LE dotted)")
+st.title("Enterprise Structure Generator — Excel + draw.io (identifier-safe, no lost hangers)")
 
 st.markdown("""
 Upload up to **9 Oracle export ZIPs** (any order):
@@ -28,7 +28,6 @@ def read_csv_from_zip(zf, name):
         return pd.read_csv(fh, dtype=str)
 
 def pick_col(df, candidates):
-    """Return the first matching column from `candidates` (exact > case-insensitive > substring)."""
     cols = list(df.columns)
     for c in candidates:
         if c in cols:
@@ -62,19 +61,17 @@ else:
     ledger_names = set()
     legal_entity_names = set()
     ledger_to_idents = {}            # ledger -> {LE identifier}
-    ident_to_le_name = {}            # LE identifier -> preferred name (ObjectName first, fallback XLE)
+    ident_to_le_name = {}            # identifier -> preferred name (ObjectName first, XLE fallback)
     bu_rows = []                     # BU rows for Tab 1
 
-    # Cost Orgs (MASTER)
+    # Cost/IO data
     costorg_rows = []                # [{Name, LegalEntityIdentifier, JoinKey}]
     books_by_joinkey = {}            # JoinKey -> {CostBookCode}
-
-    # Inventory Orgs (MASTER)
     invorg_rows = []                 # [{Code, Name, LEIdent, BUName, PCBU, Mfg}]
     invorg_rel = {}                  # InvOrgCode -> CostOrgJoinKey
 
     # Diagnostics
-    unresolved_ident_pairs = []      # [(Ledger, LE_Identifier)]
+    unresolved_ident_pairs = []      # [(Ledger, Identifier)]
     name_collisions = []             # [(Ledger, DisplayName, [idents...])]
 
     # ------------ Scan uploads ------------
@@ -94,7 +91,7 @@ else:
             else:
                 st.warning("`GL_PRIMARY_LEDGER.csv` missing `ORA_GL_PRIMARY_LEDGER_CONFIG.Name`.")
 
-        # Legal Entities (XLE master — used for fallback names & unassigned LEs)
+        # Legal Entities (XLE master — fallback names & unassigned LEs)
         df = read_csv_from_zip(z, "XLE_ENTITY_PROFILE.csv")
         if df is not None:
             name_col  = pick_col(df, ["Name", "LegalEntityName", "EntityName"])
@@ -135,8 +132,7 @@ else:
                     ident = str(r[ident_col]).strip()
                     obj   = str(r[obj_col]).strip()
                     if ident and obj:
-                        # ObjectName takes precedence
-                        ident_to_le_name[ident] = obj
+                        ident_to_le_name[ident] = obj  # ObjectName takes precedence
             else:
                 st.warning(f"`ORA_GL_JOURNAL_CONFIG_DETAIL.csv` missing needed columns. Found: {list(df.columns)}")
 
@@ -221,86 +217,79 @@ else:
                 st.warning(f"`ORA_CST_COST_ORG_INV.csv` missing needed columns (OrganizationCode, CostOrgCode). Found: {list(df.columns)}")
 
     # ------------ Derived maps & display-name disambiguation ------------
-    # Base display names for idents (ObjectName preferred → XLE → placeholder)
     def name_for_ident(ident: str) -> str:
         nm = (ident_to_le_name.get(ident, "") or "").strip()
         return nm if nm else f"[LE {ident}]"
 
-    # Ledger → list of idents
     ident_to_ledgers = {}
     for led, idents in ledger_to_idents.items():
         for ident in idents:
             ident_to_ledgers.setdefault(ident, set()).add(led)
 
-    # Pre-disambiguation names per ledger (for back-fill & diagnostics)
     ledger_to_names = {}
     for led, idents in ledger_to_idents.items():
         for ident in idents:
             nm = name_for_ident(ident)
             ledger_to_names.setdefault(led, []).append((ident, nm))
 
-    # Disambiguate names when the same display name appears under the same ledger for multiple identifiers
-    # Result: per-ledger, a stable display name per identifier
-    display_name_by_ident_per_ledger = {}  # (ledger, ident) -> display name (maybe suffixed)
+    # Disambiguate same display name under the same ledger
+    display_name_by_ident_per_ledger = {}
     for led, pairs in ledger_to_names.items():
-        # group by name
         buckets = {}
         for ident, nm in pairs:
             buckets.setdefault(nm, []).append(ident)
-        for nm, id_list in buckets.items():
-            if len(id_list) == 1:
-                display_name_by_ident_per_ledger[(led, id_list[0])] = nm
+        for nm, ids in buckets.items():
+            if len(ids) == 1:
+                display_name_by_ident_per_ledger[(led, ids[0])] = nm
             else:
-                # Collision: append [LE ident] to each
-                name_collisions.append((led, nm, sorted(id_list)))
-                for ident in id_list:
+                name_collisions.append((led, nm, sorted(ids)))
+                for ident in ids:
                     display_name_by_ident_per_ledger[(led, ident)] = f"{nm} [LE {ident}]"
 
-    # For back-fill like EG-1: LE name -> ledgers (use base names, not suffixed)
+    # For EG-1 style back-fill
     le_to_ledgers = {}
     for led, pairs in ledger_to_names.items():
         for ident, nm in pairs:
-            # Avoid placeholder-only names for back-fill if possible
             if nm.startswith("[LE "):
                 continue
             le_to_ledgers.setdefault(nm, set()).add(led)
 
+    # Also build name -> idents (for unassigned unique mapping)
+    name_to_idents = {}
+    for ident, nm in ident_to_le_name.items():
+        if nm:
+            name_to_idents.setdefault(nm, set()).add(ident)
+
     # ===================================================
-    # Tab 1: Ledger – Legal Entity – (Identifier) – Business Unit
+    # Tab 1: Ledger – Legal Entity – Identifier – Business Unit
     # ===================================================
     rows1 = []
     seen_triples = set()
     seen_ledgers_with_bu = set()
     seen_les_with_bu = set()
 
-    # Helper: quick map from LE name seen in BU file → one ident (best-effort; may be many-to-one)
-    # We only use this to annotate the identifier on BU rows; logic remains robust because we dedupe by ident.
+    # Reverse name→one ident (best-effort, first seen)
     reverse_name_to_ident = {}
     for ident, nm in ident_to_le_name.items():
         if nm and nm not in reverse_name_to_ident:
             reverse_name_to_ident[nm] = ident
 
-    # 1) BU-driven rows with EG-1 style unique back-fill
+    # 1) BU-driven rows with unique back-fill
     for r in bu_rows:
         bu  = r["Name"]
         led = r["PrimaryLedgerName"]
         le  = r["LegalEntityName"]
 
         led = led if led in ledger_names else ""
-        le  = le if le in legal_entity_names else le  # allow names not in set for safety
+        le  = le if le else ""
 
-        # back-fill ledger from LE if uniquely mapped
         if not led and le and le in le_to_ledgers and len(le_to_ledgers[le]) == 1:
             led = next(iter(le_to_ledgers[le]))
-        # back-fill LE from ledger if uniquely mapped
         if not le and led and led in ledger_to_names and len(ledger_to_names[led]) == 1:
-            le = ledger_to_names[led][0][1]  # the only name
+            le = ledger_to_names[led][0][1]
 
-        # try to fetch identifier for this LE name (best-effort)
         ident = reverse_name_to_ident.get(le, "")
-
-        # For display, if we have (ledger, ident), use the disambiguated name; else keep `le`
-        disp = display_name_by_ident_per_ledger.get((led, ident), le)
+        disp  = display_name_by_ident_per_ledger.get((led, ident), le)
 
         rows1.append({
             "Ledger Name": led,
@@ -312,7 +301,7 @@ else:
         if led: seen_ledgers_with_bu.add(led)
         if le:  seen_les_with_bu.add(le)
 
-    # 2) Ledger–LE pairs with no BU (by IDENTIFIER)
+    # 2) Ledger–LE pairs with no BU (by IDENT)
     seen_pairs = {(a, b) for (a, b, _) in seen_triples}
     for led, idents in ledger_to_idents.items():
         if not idents:
@@ -329,24 +318,33 @@ else:
                     "Business Unit": ""
                 })
 
-    # 3) Orphan ledgers (in master list) with no mapping & no BU
+    # 3) Orphan ledgers (exist in master, not mapped, no BU)
     mapped_ledgers = set(ledger_to_idents.keys())
     for led in sorted(ledger_names - mapped_ledgers - seen_ledgers_with_bu):
         rows1.append({"Ledger Name": led, "Legal Entity": "", "Legal Entity Identifier": "", "Business Unit": ""})
 
-    # 4) Unassigned LEs (no ledger, no BU)
+    # 4) Unassigned LEs (no ledger, no BU); fill ident if uniquely known for that name
     les_known = set(ident_to_le_name.values()) | set(legal_entity_names)
-    # Note: we can’t reliably produce an identifier for pure-name LEs here; leave ident blank.
     les_in_bu = {r["LegalEntityName"] for r in bu_rows if r.get("LegalEntityName")}
-    # names present in any ledger mapping:
     names_in_map = {nm for pairs in ledger_to_names.values() for _, nm in pairs}
     unassigned_les = sorted(les_known - les_in_bu - names_in_map)
     for le in unassigned_les:
-        rows1.append({"Ledger Name": "", "Legal Entity": le, "Legal Entity Identifier": "", "Business Unit": ""})
+        cand_ids = name_to_idents.get(le, set())
+        ident = next(iter(cand_ids)) if len(cand_ids) == 1 else ""
+        rows1.append({"Ledger Name": "", "Legal Entity": le, "Legal Entity Identifier": ident, "Business Unit": ""})
 
-    # Build DF and dedupe by IDENTIFIER (and BU)
+    # ---------- Build DF with EFFECTIVE KEY (fix for hanging LEs) ----------
     df1 = pd.DataFrame(rows1)
-    df1 = df1.drop_duplicates(subset=["Ledger Name", "Legal Entity Identifier", "Business Unit"]).reset_index(drop=True)
+
+    def _ekey(row):
+        ident = (row.get("Legal Entity Identifier") or "").strip()
+        if ident:
+            return f"ID::{ident}"
+        name = (row.get("Legal Entity") or "").strip()
+        return f"NAME::{name}"
+
+    df1["__LEKey"] = df1.apply(_ekey, axis=1)
+    df1 = df1.drop_duplicates(subset=["Ledger Name", "__LEKey", "Business Unit"]).reset_index(drop=True)
 
     # Sort (push blanks)
     df1["__LedgerEmpty"] = (df1["Ledger Name"] == "").astype(int)
@@ -355,7 +353,7 @@ else:
             ["__LedgerEmpty", "Ledger Name", "Legal Entity", "Business Unit"],
             ascending=[True, True, True, True]
         )
-        .drop(columns="__LedgerEmpty")
+        .drop(columns=["__LedgerEmpty", "__LEKey"])
         .reset_index(drop=True)
     )
     df1.insert(0, "Assignment", range(1, len(df1) + 1))
@@ -365,7 +363,6 @@ else:
     # ===================================================
     rows2 = []
 
-    # Helper: Cost Org name from JoinKey
     co_name_by_joinkey = {r["JoinKey"]: r["Name"] for r in costorg_rows if r.get("JoinKey")}
 
     for inv in invorg_rows:
@@ -405,7 +402,6 @@ else:
 
     df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
 
-    # Sort Tab 2 (push unassigned)
     if not df2.empty:
         df2["__LedgerEmpty"] = (df2["Ledger Name"].fillna("") == "").astype(int)
         df2["__COEmpty"]     = (df2["Cost Organization"].fillna("") == "").astype(int)
@@ -424,7 +420,6 @@ else:
     df2 = _blankify(df2)
 
     # ----------------- Diagnostics -----------------
-    # unresolved: any ident present in a ledger mapping that has only a placeholder name
     for led, idents in ledger_to_idents.items():
         for ident in idents:
             if name_for_ident(ident).startswith("[LE "):
@@ -456,7 +451,7 @@ else:
         df2.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_IOs")
         df_diag.to_excel(writer, index=False, sheet_name="Diagnostics")
 
-    st.success(f"Built {len(df1)} Tab-1 rows and {len(df2)} Tab-2 rows. (Identifier-safe + dotted IO→LE in diagram)")
+    st.success(f"Built {len(df1)} Tab-1 rows and {len(df2)} Tab-2 rows. (No lost hangers; identifier-safe.)")
     st.dataframe(df1.head(25), use_container_width=True, height=300)
     st.dataframe(df2.head(25), use_container_width=True, height=320)
     st.dataframe(df_diag.head(25), use_container_width=True, height=220)
@@ -566,7 +561,7 @@ if (
                 if all(x["Name"] != IO for x in io_by_le[(L,E)]):
                     io_by_le[(L,E)].append(rec)
 
-        # --- x coordinates with guaranteed ledger padding ---
+        # --- x coordinates ---
         next_x = LEFT_PAD
         led_x, le_x, bu_x, co_x, cb_x, io_x = {}, {}, {}, {}, {}, {}
 
@@ -622,7 +617,7 @@ if (
                 next_x = max(next_x + PAD_GROUP, max_x_used + LEDGER_PAD)
 
         # --- X for IOs attached directly to LE (no CO) ---
-        io_direct_x = {}  # (L,E,IO) -> x
+        io_direct_x = {}
         for (L, E), ios in sorted(io_by_le.items()):
             ios_sorted = sorted(ios, key=lambda k: k["Name"])
             n = len(ios_sorted)
@@ -709,7 +704,7 @@ if (
                     x_pos = io_direct_x.get((L, le, io["Name"]), le_x[(L, le)])
                     id_map[("IO_DIRECT", L, le, io["Name"])] = add_vertex(label, style, x_pos, Y_IO)
 
-        # --- Dotted background edges: IO(no CO) -> LE  (add first so they render behind)
+        # --- Dotted background edges: IO(no CO) -> LE
         for L in ledgers_all:
             for le in sorted(le_map.get(L, [])):
                 tgt = id_map.get(("E", L, le))
@@ -772,7 +767,7 @@ if (
             note = ET.SubElement(root, "mxCell", attrib={
                 "id": uuid.uuid4().hex[:8],
                 "value": "Dotted connector = IO linked directly to Legal Entity (no Cost Org)",
-                "style": "text;align=left;verticalAlign=middle;fontSize=12;fontStyle=0;",
+                "style": "text;align=left;verticalAlign=middle;fontSize=12;",
                 "vertex": "1", "parent": "1"})
             ET.SubElement(note, "mxGeometry", attrib={
                 "x": str(x+12), "y": str(y+220), "width": "520", "height": "24", "as": "geometry"})
