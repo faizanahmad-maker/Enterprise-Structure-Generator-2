@@ -393,8 +393,7 @@ else:
     )
 
 
-# ===================== DRAW.IO DIAGRAM (edges behind + dynamic IO Y + optional BU stack) =====================
-# ===================== DRAW.IO DIAGRAM (edges behind + dynamic IO Y + BU stack with normalized keys) =====================
+# ===================== DRAW.IO DIAGRAM (edges behind, dynamic IO Y, no BU stacking, CO→LE arrow gap) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame) and
@@ -402,6 +401,7 @@ if (
 ):
     import xml.etree.ElementTree as ET
     import zlib, base64, uuid
+    from collections import defaultdict
 
     def _make_drawio_xml(df_bu: pd.DataFrame, df_io: pd.DataFrame, df_costing: pd.DataFrame) -> str:
         # ---------- Geometry ----------
@@ -413,27 +413,27 @@ if (
             return int(y_parent + (y_child - y_parent) * bias)
 
         ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)
+        ELBOW_BU_TO_LE  = elbow(Y_BU, Y_LE)
         ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)
         ELBOW_CB_TO_CO  = elbow(Y_CB, Y_CO)
+        # ELBOW_IO_TO_CO computed after Y_IO is known
 
         # spacing
         MIN_GAP = 70
         def spread(base): return max(base, W + MIN_GAP)
-        BU_SPREAD_BASE = 210
+        BU_SPREAD_BASE, CO_SPREAD_BASE = 210, 230
         IO_UNDER_CO_BASE = 220
         LEDGER_BLOCK_GAP, CLUSTER_GAP, LEFT_PAD = 120, 420, 260
         MIN_UMBRELLA_GAP = 140
         MIN_GLOBAL_SPACING = 200
 
         # lanes / offsets
-        BU_LANE_OFFSET  = 180           # BU lane x-shift (when not stacked)
-        DIO_LANE_OFFSET = 420           # direct IOs lane (right)
+        BU_LANE_OFFSET  = 180           # BU lane x-shift (when COs/IOs exist)
+        DIO_LANE_OFFSET = 420           # direct IOs lane (right of LE)
 
-        # books & BU stack visuals
-        BOOK_X_OFFSET       = 220
-        BOOK_VERTICAL_GAP   = 64
-        BU_STACK_X_OFFSET   = 220       # BUs stacked to the LEFT of LE (like books)
-        BU_STACK_VERTICAL_GAP = 56      # vertical gap between stacked BUs
+        # books column (left of CO)
+        BOOK_X_OFFSET     = 220
+        BOOK_VERTICAL_GAP = 64
 
         # ---------- Styles ----------
         S_LEDGER = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6E6;strokeColor=#C86868;fontSize=12;"
@@ -441,7 +441,7 @@ if (
         S_BU     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1B3;strokeColor=#B38F00;fontSize=12;"
         S_CO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2F0C2;strokeColor=#008000;fontSize=12;"
         S_CB     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#A0D080;strokeColor=#004d00;fontSize=12;"
-        S_CB_P   = "rounded=1;whiteSpace=wrap;html=1;fillColor=#A0D080;strokeColor=#004d00;strokeWidth=2;fontSize=12;"
+        S_CB_P   = "rounded=1;whiteSpace=wrap;html=1;fillColor=#A0D080;strokeColor=#004d0 0;strokeWidth=2;fontSize=12;"
         S_IO     = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#004080;fontSize=12;"
         S_IO_PLT = "rounded=1;whiteSpace=wrap;html=1;fillColor=#C2E0F9;strokeColor=#1F4D7A;strokeWidth=2;fontSize=12;"
         S_EDGE   = ("endArrow=block;rounded=1;edgeStyle=orthogonalEdgeStyle;orthogonal=1;"
@@ -482,7 +482,7 @@ if (
         df_bu = df_bu[["Ledger Name","Legal Entity","Business Unit"]].copy().fillna("").astype(str)
         _strip_cols(df_bu, ["Ledger Name","Legal Entity","Business Unit"])
 
-        # Tab 2
+        # Tab 2 (Inventory Orgs)
         LCOL = pick(df_io, ["Ledger Name","Ledger"])
         ECOL = pick(df_io, ["Legal Entity","LegalEntity"])
         COCOL= pick(df_io, ["Cost Organization","Cost Org","CostOrganization"])
@@ -493,7 +493,7 @@ if (
                               IOCOL:"Inventory Org", MFGCOL:"Manufacturing Plant"}, inplace=True)
         _strip_cols(df_io, ["Ledger Name","Legal Entity","Cost Organization","Inventory Org","Manufacturing Plant"])
 
-        # Tab 3
+        # Tab 3 (Costing)
         cLCOL = pick(df_costing, ["Ledger Name","Ledger"])
         cECOL = pick(df_costing, ["Legal Entity","LegalEntity"])
         cCO   = pick(df_costing, ["Cost Organization","Cost Org","CostOrganization"])
@@ -508,8 +508,7 @@ if (
         ledgers_all = sorted({*df_bu["Ledger Name"].unique(), *df_io["Ledger Name"].unique()} - {""})
 
         # ---------- Build maps ----------
-        from collections import defaultdict
-        le_map = defaultdict(set)
+        le_map = defaultdict(set)        # L -> {E}
         bu_map = defaultdict(list)       # (L,E) -> [BU]
         co_map = defaultdict(list)       # (L,E) -> [CO]
         io_by_co = defaultdict(list)     # (L,E,C) -> [{"Name","Mfg"}]
@@ -560,7 +559,7 @@ if (
         next_x = LEFT_PAD
         led_x = {}
         le_x = {}
-        bu_pos = {}     # (L,E,BU) -> (x,y)
+        bu_x = {}       # (L,E,BU) -> x
         co_x = {}       # (L,E,C) -> x
         io_x = {}       # (L,E,C,IO) -> (x, mfg)
         dio_x = {}      # (L,E,IO) -> (x, mfg)
@@ -588,21 +587,14 @@ if (
                 has_co  = bool(cos)
                 has_dio = bool(dio_by_le[(L,E)])
 
-                # Decide BU layout:
-                use_bu_stack = (has_co and len(bu_list) > 1)
+                # BU center: when COs or direct IOs exist, shift BU lane left
+                bu_center  = le_pos if (has_bu and not (has_co or has_dio)) else (le_pos - BU_LANE_OFFSET if has_bu else le_pos)
+                co_center  = le_pos  # CO straight down
+                dio_center = le_pos + DIO_LANE_OFFSET if has_dio else None
 
-                # BUs
-                if has_bu:
-                    if use_bu_stack:
-                        # vertical stack to the LEFT of LE (like books)
-                        x_bu = le_pos - BU_STACK_X_OFFSET
-                        for i, b in enumerate(bu_list):
-                            bu_pos[(L,E,b)] = (x_bu, Y_BU + i*BU_STACK_VERTICAL_GAP)
-                    else:
-                        # normal horizontal lane (existing behavior)
-                        bu_center  = le_pos if (has_bu and not (has_co or has_dio)) else (le_pos - BU_LANE_OFFSET if has_bu else le_pos)
-                        for x,b in zip(centers(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
-                            bu_pos[(L,E,b)] = (x, Y_BU)
+                # BUs (horizontal)
+                for x,b in zip(centers(bu_center, len(bu_list), BU_SPREAD_BASE), bu_list):
+                    bu_x[(L,E,b)] = x
 
                 # COs
                 if has_co:
@@ -610,7 +602,7 @@ if (
                     for idx, C in enumerate(sorted(cos)):
                         half = co_cluster_halfwidth(L,E,C)
                         if idx == 0:
-                            xC = le_pos
+                            xC = co_center
                         else:
                             prev = placed[-1]
                             need = prev["half"] + half + MIN_GAP
@@ -621,7 +613,7 @@ if (
                         # IOs under this CO
                         ios = sorted(io_by_co[(L,E,C)], key=lambda d: d["Name"])
                         xs = centers(xC, len(ios), IO_UNDER_CO_BASE)
-                        xs = enforce_spacing_sorted(xs, MIN_GAP)
+                        xs = enforce_spacing_sorted(xs, MIN_GAP)  # local tidy
                         for xio, rec in zip(xs, ios):
                             io_x[(L,E,C,rec["Name"])] = (xio, rec["Mfg"])
 
@@ -632,14 +624,14 @@ if (
                 # Direct IOs
                 if has_dio:
                     dlist = sorted(dio_by_le[(L,E)], key=lambda d: d["Name"])
-                    xs = centers(le_pos + DIO_LANE_OFFSET, len(dlist), IO_UNDER_CO_BASE)
+                    xs = centers(dio_center, len(dlist), IO_UNDER_CO_BASE)
                     xs = enforce_spacing_sorted(xs, MIN_GAP)
                     for xio, rec in zip(xs, dlist):
                         dio_x[(L,E,rec["Name"])] = (xio, rec["Mfg"])
 
-                # umbrella guard
+                # umbrella guard: ensure LE umbrellas don’t overlap horizontally
                 xs_span = [le_pos]
-                xs_span += [bu_pos[(L,E,b)][0] for b in bu_list]
+                xs_span += [bu_x[(L,E,b)] for b in bu_list]
                 for C in cos:
                     xs_span.append(co_x[(L,E,C)])
                     xs_span += [io_x[(L,E,C,r["Name"])][0] for r in io_by_co[(L,E,C)]]
@@ -652,8 +644,8 @@ if (
                 if prev_umbrella_max_x is not None and min_x < prev_umbrella_max_x + MIN_UMBRELLA_GAP:
                     shift = (prev_umbrella_max_x + MIN_UMBRELLA_GAP) - min_x
                     le_x[(L,E)] += shift
-                    for k in list(bu_pos.keys()):
-                        if k[0]==L and k[1]==E: bu_pos[k] = (bu_pos[k][0] + shift, bu_pos[k][1])
+                    for k in list(bu_x.keys()):
+                        if k[0]==L and k[1]==E: bu_x[k] += shift
                     for k in list(co_x.keys()):
                         if k[0]==L and k[1]==E: co_x[k] += shift
                     for k in list(io_x.keys()):
@@ -684,8 +676,8 @@ if (
         for L in ledgers_all:
             for E in sorted(le_map[L]):
                 # BU layer
-                bu_keys = [(k, bu_pos[k][0]) for k in bu_pos if k[0]==L and k[1]==E]
-                layer_global_spacing(lambda k, nx: bu_pos.__setitem__(k, (nx, bu_pos[k][1])), bu_keys)
+                bu_keys = [(k, bu_x[k]) for k in bu_x if k[0]==L and k[1]==E]
+                layer_global_spacing(lambda k, nx: bu_x.__setitem__(k, nx), bu_keys)
 
                 # CO layer
                 co_keys = [(k, co_x[k]) for k in co_x if k[0]==L and k[1]==E]
@@ -714,13 +706,13 @@ if (
         model   = ET.SubElement(diagram, "mxGraphModel", attrib={
             "dx":"1284","dy":"682","grid":"1","gridSize":"10",
             "page":"1","pageWidth":"1920","pageHeight":"1080",
-            "background":"#111827"  # keep your dark background; change if needed
+            "background":"#ffffff"
         })
         root    = ET.SubElement(model, "root")
         ET.SubElement(root, "mxCell", attrib={"id":"0"})
         ET.SubElement(root, "mxCell", attrib={"id":"1","parent":"0"})
 
-        # ---- Layers: ensure EDGES are behind VERTICES ----
+        # ---- Layers: edges behind vertices ----
         edges_layer_id = uuid.uuid4().hex[:8]
         verts_layer_id = uuid.uuid4().hex[:8]
         ET.SubElement(root, "mxCell", attrib={"id":edges_layer_id, "parent":"1", "visible":"1", "layer":"1"})
@@ -741,8 +733,14 @@ if (
             for (px, py) in points:
                 ET.SubElement(arr, "mxPoint", attrib={"x":str(int(px)),"y":str(int(py))})
 
-        def add_edge_with_elbow(src_id, tgt_id, src_center_x, tgt_center_x, elbow_y, parent=edges_layer_id):
-            add_edge_points(src_id, tgt_id, [(src_center_x, elbow_y), (tgt_center_x, elbow_y)], parent=parent)
+        def add_edge_with_elbow(src_id, tgt_id, src_center_x, tgt_center_x, elbow_y, extra_gap=0, parent=edges_layer_id):
+            # If extra_gap>0, lower the elbow run to avoid crossing other edges
+            if extra_gap > 0:
+                add_edge_points(src_id, tgt_id, [(src_center_x, elbow_y + extra_gap),
+                                                  (tgt_center_x, elbow_y + extra_gap)], parent=parent)
+            else:
+                add_edge_points(src_id, tgt_id, [(src_center_x, elbow_y),
+                                                  (tgt_center_x, elbow_y)], parent=parent)
 
         id_map = {}
         # Ledgers
@@ -752,14 +750,14 @@ if (
         for (L,E), x in le_x.items():
             id_map[("E",L,E)] = add_vertex(E, S_LE, x, Y_LE)
             add_edge_with_elbow(id_map[("E",L,E)], id_map[("L",L)], cx(x), cx(led_x[L]), ELBOW_LE_TO_LED)
-        # BUs
-        for (L,E,b), (bx, by) in bu_pos.items():
-            id_map[("B",L,E,b)] = add_vertex(b, S_BU, bx, by)
-            add_edge_with_elbow(id_map[("B",L,E,b)], id_map[("E",L,E)], cx(bx), cx(le_x[(L,E)]), elbow(by, Y_LE))
-        # COs
+        # BUs (horizontal lane)
+        for (L,E,b), x in bu_x.items():
+            id_map[("B",L,E,b)] = add_vertex(b, S_BU, x, Y_BU)
+            add_edge_with_elbow(id_map[("B",L,E,b)], id_map[("E",L,E)], cx(x), cx(le_x[(L,E)]), ELBOW_BU_TO_LE)
+        # COs (with minimum elbow drop to avoid cutting BU edges)
         for (L,E,c), x in co_x.items():
             id_map[("C",L,E,c)] = add_vertex(c, S_CO, x, Y_CO)
-            add_edge_with_elbow(id_map[("C",L,E,c)], id_map[("E",L,E)], cx(x), cx(le_x[(L,E)]), ELBOW_CO_TO_LE)
+            add_edge_with_elbow(id_map[("C",L,E,c)], id_map[("E",L,E)], cx(x), cx(le_x[(L,E)]), ELBOW_CO_TO_LE, extra_gap=40)
         # Books (vertical, left of CO)
         for (L,E,c,bk), (xbk, ybk) in cb_xy.items():
             style = S_CB_P if cb_primary.get((L,E,c,bk), False) else S_CB
@@ -786,11 +784,12 @@ if (
             v = add_vertex(label, style, x, Y_IO)
             le_center_x = cx(le_x[(L,E)])
             trunk_x = dio_trunk_x[(L,E)]
+            # route via a vertical trunk then into LE at BU elbow height
             add_edge_points(
                 v, id_map[("E",L,E)],
                 [(trunk_x, ELBOW_IO_TO_CO),
-                 (trunk_x, elbow(Y_BU, Y_LE)),
-                 (le_center_x, elbow(Y_BU, Y_LE))]
+                 (trunk_x, ELBOW_BU_TO_LE),
+                 (le_center_x, ELBOW_BU_TO_LE)]
             )
 
         # Legend
