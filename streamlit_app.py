@@ -43,15 +43,21 @@ def pick_col(df, candidates):
                 return existing
     return None
 
-# new: make NaNs / "nan" strings blank for display/export
+# --- tiny, safe "blankify" for display/export (no regex) ---
 def _blankify(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+    # true NaNs → ""
+    df = df.copy()
     df = df.fillna("")
-    df = df.replace({r"^\s*(?i)nan\s*$": ""}, regex=True)
-    for c in df.columns:
-        if pd.api.types.is_string_dtype(df[c]):
-            df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
+    # literal "nan" strings (from prior str(...) casts) → ""
+    obj_cols = list(df.select_dtypes(include=["object"]).columns)
+    for c in obj_cols:
+        s = df[c]
+        # Only touch strings; leave numbers/dates alone
+        mask = s.apply(lambda x: isinstance(x, str) and x.strip().lower() == "nan")
+        if mask.any():
+            df.loc[mask, c] = ""
     return df
 
 if not uploads:
@@ -241,7 +247,7 @@ else:
     # ===================================================
     rows1, seen_triples, seen_ledgers_with_bu = [], set(), set()
 
-    # Emit BU-driven rows
+    # Emit BU-driven rows (strict)
     for r in bu_rows:
         bu  = r["Name"]
         led = r["PrimaryLedgerName"]
@@ -276,8 +282,6 @@ else:
 
     # ===================================================
     # Tab 2: Ledger – LE – Cost Org – Cost Book – Inventory Org – ProfitCenter BU – Management BU – Mfg Plant
-    #  - Emits all IOs (even if unassigned)
-    #  - Sorts so "hanging" (missing Ledger or Cost Org) drop to bottom
     # ===================================================
     rows2 = []
 
@@ -295,7 +299,6 @@ else:
         co_name = co_name_by_joinkey.get(co_key, "") if co_key else ""
         books   = "; ".join(sorted(books_by_joinkey.get(co_key, []))) if co_key else ""
 
-        # Emit rows; if multiple ledgers for the LE, fan out
         if leds:
             for led in sorted(leds):
                 rows2.append({
@@ -309,7 +312,6 @@ else:
                     "Manufacturing Plant": inv.get("Mfg", "")
                 })
         else:
-            # Hanging IO (no ledger alignment)
             rows2.append({
                 "Ledger Name": "",
                 "Legal Entity": le_name,
@@ -323,35 +325,33 @@ else:
 
     df2 = pd.DataFrame(rows2).drop_duplicates().reset_index(drop=True)
 
-    # ---------- Hanging-first sort controls (push unassigned to bottom) ----------
-    # Ledger empty → bottom; Cost Org empty → bottom; then normal alpha
+    # Push unassigned to bottom; then alpha
     if not df2.empty:
         df2["__LedgerEmpty"] = (df2["Ledger Name"].fillna("") == "").astype(int)
         df2["__COEmpty"]     = (df2["Cost Organization"].fillna("") == "").astype(int)
-        df2["__HasIO"]       = 1
         df2 = (
             df2.sort_values(
                 ["__LedgerEmpty", "Ledger Name", "Legal Entity", "__COEmpty", "Cost Organization", "Inventory Org"],
                 ascending=[True, True, True, True, True, True]
             )
-            .drop(columns=["__LedgerEmpty", "__COEmpty", "__HasIO"])
+            .drop(columns=["__LedgerEmpty", "__COEmpty"])
             .reset_index(drop=True)
         )
-
     df2.insert(0, "Assignment", range(1, len(df2) + 1))
 
-    # ------------ Clean to blanks & Excel Output ------------
-    df1_clean = _blankify(df1)
-    df2_clean = _blankify(df2)
+    # ----------- turn all NaNs/‘nan’ into blanks for both tabs -----------
+    df1 = _blankify(df1)
+    df2 = _blankify(df2)
 
+    # ------------ Excel Output ------------
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        df1_clean.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
-        df2_clean.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_IOs")
+        df1.to_excel(writer, index=False, sheet_name="Ledger_LE_BU_Assignments")
+        df2.to_excel(writer, index=False, sheet_name="Ledger_LE_CostOrg_IOs")
 
-    st.success(f"Built {len(df1_clean)} BU rows and {len(df2_clean)} Inventory Org rows (hanging handled).")
-    st.dataframe(df1_clean.head(25), use_container_width=True, height=280)
-    st.dataframe(df2_clean.head(25), use_container_width=True, height=320)
+    st.success(f"Built {len(df1)} BU rows and {len(df2)} Inventory Org rows (hanging handled).")
+    st.dataframe(df1.head(25), use_container_width=True, height=280)
+    st.dataframe(df2.head(25), use_container_width=True, height=320)
 
     st.download_button(
         "⬇️ Download Excel (EnterpriseStructure.xlsx)",
