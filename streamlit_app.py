@@ -393,7 +393,7 @@ else:
     )
 
 
-# ===================== DRAW.IO DIAGRAM (CO straight down + GLOBAL MIN SPACING + guided trunk) =====================
+# ===================== DRAW.IO DIAGRAM (CO straight down + GLOBAL MIN SPACING + guided trunk + dynamic IO Y) =====================
 if (
     "df1" in locals() and isinstance(df1, pd.DataFrame) and not df1.empty and
     "df2" in locals() and isinstance(df2, pd.DataFrame) and
@@ -405,7 +405,8 @@ if (
     def _make_drawio_xml(df_bu: pd.DataFrame, df_io: pd.DataFrame, df_costing: pd.DataFrame) -> str:
         # ---------- Geometry ----------
         W, H = 180, 48
-        Y_LEDGER, Y_LE, Y_BU, Y_CO, Y_CB, Y_IO = 150, 320, 480, 640, 800, 960
+        Y_LEDGER, Y_LE, Y_BU, Y_CO, Y_CB = 150, 320, 480, 640, 800
+        # NOTE: Y_IO will be computed later (after Cost Books are scanned)
 
         def elbow(y_child, y_parent, bias=0.75):
             return int(y_parent + (y_child - y_parent) * bias)
@@ -413,8 +414,8 @@ if (
         ELBOW_LE_TO_LED = elbow(Y_LE, Y_LEDGER)
         ELBOW_BU_TO_LE  = elbow(Y_BU, Y_LE)
         ELBOW_CO_TO_LE  = elbow(Y_CO, Y_LE)
-        ELBOW_IO_TO_CO  = elbow(Y_IO, Y_CO)
         ELBOW_CB_TO_CO  = elbow(Y_CB, Y_CO)
+        # ELBOW_IO_TO_CO will be set later, once Y_IO is known
 
         # spacing
         MIN_GAP = 70
@@ -425,7 +426,7 @@ if (
         MIN_UMBRELLA_GAP = 140
 
         # GLOBAL spacing per LE, per layer:
-        MIN_GLOBAL_SPACING = 200  # <<< raise if you want even more air
+        MIN_GLOBAL_SPACING = 200
 
         # lane offsets (CO stays vertical)
         BU_LANE_OFFSET  = 180
@@ -541,6 +542,13 @@ if (
             if "Primary Cost Book" in df_costing.columns:
                 raw = str(r.get("Primary Cost Book","")).strip().lower()
                 cb_primary[(L,E,C,bk)] = raw in ("yes","y","true","1","primary")
+
+        # ---------- Dynamic IO vertical based on max Cost Books ----------
+        max_books = max((len(v) for v in cb_by_co.values()), default=0)
+        BASE_IO_Y = 960
+        EXTRA_IO_OFFSET = max_books * BOOK_VERTICAL_GAP
+        Y_IO = BASE_IO_Y + EXTRA_IO_OFFSET
+        ELBOW_IO_TO_CO  = elbow(Y_IO, Y_CO)
 
         # ---------- Placement ----------
         next_x = LEFT_PAD
@@ -796,4 +804,5 @@ if (
         use_container_width=True
     )
     st.markdown(f"[🔗 Open in draw.io (preview)]({_drawio_url_from_xml(_xml)})")
+
 
