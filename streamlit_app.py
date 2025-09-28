@@ -434,7 +434,7 @@ else:
         df2.to_excel(writer, index=False, sheet_name="Inventory Org Structure")   # Tab 2 (no Cost Book)
         df3.to_excel(writer, index=False, sheet_name="Costing Structure")         # Tab 3
 
-    st.success(f"Built {len(df1)} Core rows, {len[df2]} Inventory rows, {len(df3)} Costing rows.")
+    st.success(f"Built {len(df1)} Core rows, {len(df2)} Inventory rows, {len(df3)} Costing rows.")
     st.dataframe(df1.head(20), use_container_width=True, height=260)
     st.dataframe(df2.head(20), use_container_width=True, height=260)
     st.dataframe(df3.head(20), use_container_width=True, height=260)
