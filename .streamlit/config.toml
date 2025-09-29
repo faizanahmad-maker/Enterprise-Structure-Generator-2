@@ -1,0 +1,7 @@
+[theme]
+base = "dark"                        # change to "light" if you prefer
+primaryColor = "#6EE7B7"             # button & accent color
+backgroundColor = "#0B0F14"          # page background
+secondaryBackgroundColor = "#121824" # cards/containers
+textColor = "#E5EEF6"
+font = "sans serif"                  # "serif" | "monospace" | "sans serif"
