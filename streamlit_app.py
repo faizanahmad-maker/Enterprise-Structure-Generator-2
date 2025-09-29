@@ -4,7 +4,7 @@ import streamlit as st
 from collections import defaultdict
 
 st.set_page_config(page_title="Enterprise Structure Generator", page_icon="📊", layout="wide")
-st.title("Enterprise Structure Generator — Excel + draw.io (3 tabs)")
+st.title("Enterprise Structure Generator — Excel + draw.io")
 
 st.markdown("""
 Upload up to **9 Oracle export ZIPs** (any order):
@@ -15,7 +15,6 @@ Upload up to **9 Oracle export ZIPs** (any order):
 - `Manage Cost Organizations` → **CST_COST_ORGANIZATION.csv**
 - `Manage Cost Organization Relationships` → **CST_COST_ORG_BOOK.csv**
 - `Manage Inventory Organizations` → **INV_ORGANIZATION_PARAMETER.csv**
-- `Cost Org ↔ Inventory Org relationships` → **ORA_CST_COST_ORG_INV.csv**
 """)
 
 uploads = st.file_uploader("Drop your ZIPs here", type="zip", accept_multiple_files=True)
