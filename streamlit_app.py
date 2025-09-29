@@ -5,6 +5,22 @@ from collections import defaultdict
 
 st.set_page_config(page_title="Enterprise Structure Generator", page_icon="📊", layout="wide")
 st.title("Enterprise Structure Generator — Excel + draw.io")
+st.set_page_config(page_title="Enterprise Structure Generator", page_icon="📊", layout="wide")
+
+st.markdown("""
+<style>
+/* tighten page + give a max width */
+.block-container {padding-top:1.2rem; padding-bottom:2rem; max-width:1300px;}
+/* card look for sections */
+.card{background:#121824;border:1px solid #1f2a3a;border-radius:14px;padding:14px 16px;margin-bottom:14px;}
+/* nicer buttons & downloads */
+.stButton>button, .stDownloadButton>button {border-radius:12px; padding:8px 14px; font-weight:600;}
+/* tables a bit tighter */
+.dataframe td, .dataframe th {padding:6px 8px !important; font-size:0.92rem;}
+/* headline band if you want it */
+.header-band{background:linear-gradient(90deg,#0B0F14,#111a28 55%); border:1px solid #1f2a3a; border-radius:16px; padding:18px 22px; margin-bottom:14px;}
+</style>
+""", unsafe_allow_html=True)
 
 st.markdown("""
 Upload up to **9 Oracle export ZIPs** (any order):
