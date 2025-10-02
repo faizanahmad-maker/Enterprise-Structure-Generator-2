@@ -8,13 +8,13 @@ st.title("Enterprise Structure Generator — Excel + draw.io")
 
 st.markdown("""
 Upload up to **9 Oracle export ZIPs** (any order):
-- `Manage General Ledger` → **GL_PRIMARY_LEDGER.csv**
-- `Manage Legal Entities` → **XLE_ENTITY_PROFILE.csv**
-- `Assign Legal Entities` → **ORA_LEGAL_ENTITY_BAL_SEG_VAL_DEF.csv**
-- `Manage Business Units` → **FUN_BUSINESS_UNIT.csv**
-- `Manage Cost Organizations` → **CST_COST_ORGANIZATION.csv**
-- `Manage Cost Organization Relationships` → **CST_COST_ORG_BOOK.csv**
-- `Manage Inventory Organizations` → **INV_ORGANIZATION_PARAMETER.csv**
+- `Manage General Ledger` 
+- `Manage Legal Entities` 
+- `Assign Legal Entities`
+- `Manage Business Units` 
+- `Manage Cost Organizations` 
+- `Manage Cost Organization Relationships`
+- `Manage Inventory Organizations` 
 """)
 
 uploads = st.file_uploader("Drop your ZIPs here", type="zip", accept_multiple_files=True)
